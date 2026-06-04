@@ -300,15 +300,21 @@ function runOpencode(args: {
 
 async function captureGitDiff(workspaceRoot: string): Promise<string> {
   const gitPath = detectBin(["/usr/bin/git", "/bin/git", "/usr/local/bin/git"]) ?? "git"
-  return new Promise((resolve) => {
-    const child = spawn(gitPath, ["-C", workspaceRoot, "diff"], {
-      env: { ...process.env, GIT_PAGER: "cat" },
+  const runGit = (args: string[], capture: boolean): Promise<string> =>
+    new Promise((resolve) => {
+      const child = spawn(gitPath, ["-C", workspaceRoot, ...args], {
+        env: { ...process.env, GIT_PAGER: "cat" },
+      })
+      let stdout = ""
+      if (capture) child.stdout?.on("data", (b) => (stdout += b.toString("utf8")))
+      child.on("close", () => resolve(stdout))
+      child.on("error", () => resolve(""))
     })
-    let stdout = ""
-    child.stdout?.on("data", (b) => (stdout += b.toString("utf8")))
-    child.on("close", () => resolve(stdout))
-    child.on("error", () => resolve(""))
-  })
+  // Mark untracked files as intent-to-add so newly-created files appear in
+  // `git diff` without being committed. Plain `git diff` only shows changes
+  // to tracked files, which silently drops new-file patches the agent wrote.
+  await runGit(["add", "-AN"], false)
+  return runGit(["diff", "--binary"], true)
 }
 
 interface OutputJsonl {
