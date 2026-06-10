@@ -24,6 +24,7 @@ import path from "node:path"
 import os from "node:os"
 import { spawn } from "node:child_process"
 import { runDeepReset } from "./deep_reset"
+import { bootstrapRepoIfMissing } from "./bootstrap_repo"
 // opencode's built-in anthropic system prompt — Bun bundles .txt as a string.
 // Used as the default when no --system-prompt override is passed.
 import PROMPT_ANTHROPIC from "../session/prompt/anthropic.txt"
@@ -402,8 +403,19 @@ async function main() {
     OPENCODE_DISABLE_ENV_PROMPT: "1",
   }
 
+  // Bootstrap a git repo if the SIF shipped a flat source tree (swe-bench-ext
+  // and some SWE-rebench variants). Without this, captureGitDiff returns ""
+  // and every patch is recorded as 0 bytes.
+  const { freshInit } = await bootstrapRepoIfMissing(workspaceRoot)
+
   // Prune git history past base_commit so the agent can't reach future commits.
-  await runDeepReset(workspaceRoot, String(instance.base_commit ?? ""))
+  // Skip when we just freshly initialized: the dataset's upstream base_commit
+  // SHA doesn't exist in our local repo, so deep_reset would just fail
+  // rev-parse and fall through to its nuclear pass. The fresh `HEAD` is
+  // already the correct baseline (also tagged `opencode_bench_baseline`).
+  if (!freshInit) {
+    await runDeepReset(workspaceRoot, String(instance.base_commit ?? ""))
+  }
 
   const opencodeBin = detectOpencodeBin()
   const result = await runOpencode({
