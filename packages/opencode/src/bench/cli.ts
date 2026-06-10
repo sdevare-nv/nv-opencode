@@ -444,7 +444,13 @@ async function main() {
 
   console.log(`[bench] wrote ${outPath} (patch=${patch.length} bytes, error=${error ?? "none"})`)
 
-  if (result.exitCode !== 0) process.exit(1)
+  // Mirror opencode's exit code explicitly. Falling off the end of main() and
+  // letting Bun drain the event loop produced a flaky exit=1 even when the
+  // bench wrote output.jsonl cleanly (sqlite migration handles, residual
+  // child-stdio pipes from the opencode subprocess). Gym's runner treats any
+  // non-zero apptainer exit as `Agent command failed` and discards the
+  // already-written patch, so we MUST exit 0 deterministically on success.
+  process.exit(result.exitCode === 0 ? 0 : 1)
 }
 
 main().catch((err) => {
