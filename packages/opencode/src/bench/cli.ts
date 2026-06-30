@@ -139,17 +139,7 @@ function loadGymConfig(configPath: string): Record<string, unknown> {
   return JSON.parse(readFileSync(configPath, "utf8"))
 }
 
-// Default is opencode's built-in anthropic system prompt + a short SWE-bench
-// addendum (workspace is git-tracked, harness captures git diff as the patch,
-// don't commit/format the diff yourself, don't modify the test files).
-const SWE_BENCH_ADDENDUM = `
-
-# SWE-bench harness context
-
-You are running inside a SWE-bench evaluation harness on a checked-out git repository. The harness will capture the final \`git diff\` of the workspace as your patch — do not commit, push, or format the diff yourself. Do NOT modify the test files unless the task explicitly says so. Stop calling tools once you are confident the issue is fully resolved.
-`
-
-const DEFAULT_SYSTEM_PROMPT = PROMPT_ANTHROPIC + SWE_BENCH_ADDENDUM
+const DEFAULT_SYSTEM_PROMPT = PROMPT_ANTHROPIC
 
 async function buildConfigDir(args: {
   instanceId: string
