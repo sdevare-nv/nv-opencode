@@ -166,6 +166,12 @@ async function buildConfigDir(args: {
           baseURL: args.baseURL,
           completionsDir: args.completionsDir,
           instanceId: args.instanceId,
+          // Bumped from provider defaults (3 retries / 600s) — a transient
+          // model-server timeout streak otherwise tears down the whole
+          // session and produces an empty model_patch even after the agent
+          // has done meaningful exploration.
+          retries: 6,
+          requestTimeoutMs: 1_200_000,
         },
         models: {
           [args.modelName]: {
