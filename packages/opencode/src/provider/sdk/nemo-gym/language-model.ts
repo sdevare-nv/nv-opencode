@@ -421,10 +421,12 @@ export class NemoGymLanguageModel implements LanguageModelV3 {
     }
 
     const retries = this.cfg.retries ?? 3
+    const timeoutMs = this.cfg.requestTimeoutMs ?? 0
     let lastErr: unknown = null
     for (let attempt = 0; attempt < retries; attempt++) {
       const ac = new AbortController()
-      const timer = setTimeout(() => ac.abort(), this.cfg.requestTimeoutMs)
+      // timeoutMs<=0 means "no timeout" — don't install the abort timer.
+      const timer = timeoutMs > 0 ? setTimeout(() => ac.abort(), timeoutMs) : null
       try {
         const res = await fetch(url, {
           method: "POST",
@@ -432,7 +434,7 @@ export class NemoGymLanguageModel implements LanguageModelV3 {
           body: JSON.stringify(params),
           signal: ac.signal,
         })
-        clearTimeout(timer)
+        if (timer) clearTimeout(timer)
         if (!res.ok) {
           const text = await res.text().catch(() => "")
           throw new Error(`NeMoGym ${url} ${res.status}: ${text.slice(0, 500)}`)
@@ -448,10 +450,12 @@ export class NemoGymLanguageModel implements LanguageModelV3 {
         const responseJson = (await res.json()) as ChatResponse
         return { responseJson }
       } catch (err) {
-        clearTimeout(timer)
+        if (timer) clearTimeout(timer)
         lastErr = err
         if (attempt === retries - 1) break
-        await new Promise((r) => setTimeout(r, 1000 * 2 ** attempt))
+        // Cap exponential backoff at 60s so unlimited-retries configs don't blow up the delay.
+        const backoffMs = Math.min(1000 * 2 ** attempt, 60_000)
+        await new Promise((r) => setTimeout(r, backoffMs))
       }
     }
     throw new Error(`NeMoGym chat completions failed after ${retries} attempts: ${String(lastErr)}`)
