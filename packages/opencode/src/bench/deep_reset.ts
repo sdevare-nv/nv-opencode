@@ -100,8 +100,12 @@ export async function runDeepReset(workspaceRoot: string, baseCommit: string): P
   const cmd = `cd ${shellQuote(workspaceRoot)} && ` + buildDeepResetCmd(baseCommit)
   console.log(`[bench] deep_reset workspace=${workspaceRoot} base=${baseCommit} shell=${shell}`)
   await new Promise<void>((resolve) => {
+    // 10 min hard cap. In-place reset on real repos (5.7 MB → 3.5 GB)
+    // finishes well under 20s; anything past 10 min is a hang.
     const child = spawn(shell, ["-c", cmd], {
       stdio: ["ignore", "inherit", "inherit"],
+      timeout: 600_000,
+      killSignal: "SIGKILL",
     })
     child.on("close", (code) => {
       const rc = code ?? 0
