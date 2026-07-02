@@ -1,18 +1,32 @@
 /**
- * Strip git history past base_commit so the agent can't reach future commits.
+ * Pin HEAD at base_commit and drop every ref/reflog entry/object that reaches
+ * commits past base_commit.
  *
- * Port of nv-OpenHands' `_deep_reset_to_base_commit`
- * (evaluation/benchmarks/swe_bench/run_infer.py:774). Two-pass design:
+ * Ported from the improved nv-OpenHands version in
+ * `evaluation/benchmarks/swe_bench/run_infer.py` (`_deep_reset_to_base_commit`).
+ * See its docstring for design rationale. Summary:
  *
- *   - Careful pass: per-ref iteration with `git for-each-ref`. Preserves
- *     local branches that don't descend from base, resets branches that do,
- *     deletes tags/remote-tracking/stash/notes refs past base.
- *   - Nuclear fallback: batch-delete every tag/remote/stash/notes ref + every
- *     local branch in two `git update-ref --stdin` calls. Microseconds
- *     regardless of ref count — handles monorepos with thousands of refs
- *     where the careful pass times out.
+ *   - In-place cleanup (no bundle, no .git swap). Each step is best-effort;
+ *     only the final HEAD-at-BASE check decides success.
+ *   - Batch-deletes every ref namespace that can reach post-base commits
+ *     (`refs/tags`, `refs/remotes`, `refs/stash`, `refs/notes`,
+ *     `refs/replace`, `refs/prefetch`, `refs/pull`) plus local branches
+ *     other than the current one. Uses "option no-deref" per entry so
+ *     symbolic refs (refs/remotes/NAME/HEAD) don't abort the transaction.
+ *   - `git repack -ad` (lowercase -a) to drop unreachable objects from the
+ *     pack in one step — avoids the demote-to-loose intermediate that made
+ *     `-Ad` take ~10 minutes on repos like facebook/react.
+ *   - Sets `user.email`/`user.name` and runs `git clean -fd` so downstream
+ *     agent commands work even on containers with no global git identity
+ *     or with leftover untracked files from a previous run.
+ *   - On failure, logs `[bench] REBUILD_FAILED` and returns anyway so the
+ *     agent still runs (grep task logs for `REBUILD_FAILED` to filter these
+ *     instances from clean-run analysis).
  *
- * `|| true` at the very end so a busted git state can't kill the agent run.
+ * Measured on 20 real repos ranging from 5.7 MB (pallets/click) to 997 MB
+ * (facebook/react): all pass with HEAD=BASE, refs=1, reflog=0, post-base
+ * `cat-file` returns "Not a valid object name". Slowest: cpython at 12.5s.
+ * facebook/react: 4.1s (previous `-Ad`-based version: 662s).
  */
 
 import { spawn } from "node:child_process"
@@ -30,76 +44,46 @@ function detectShell(): string | null {
   return null
 }
 
-function carefulPass(baseCommit: string): string {
-  return (
-    `echo "[deep_reset:careful] start" && ` +
-    `BASE=$(git rev-parse --verify ${baseCommit}^{commit}) && ` +
-    `ORIG_BRANCH=$(git symbolic-ref --short -q HEAD || echo main) && ` +
-    `echo "[deep_reset:careful] base=$BASE orig_branch=$ORIG_BRANCH" && ` +
-    `git checkout --detach "$BASE" && ` +
-    `echo "[deep_reset:careful] resetting local branches descending from base..." && ` +
-    `git for-each-ref --format="%(refname)" refs/heads | while read -r ref; do ` +
-    `  tip=$(git rev-parse -q --verify "$ref^{commit}" 2>/dev/null || true); ` +
-    `  [ -z "$tip" ] && continue; ` +
-    `  if [ "$tip" != "$BASE" ] && git merge-base --is-ancestor "$BASE" "$tip"; then ` +
-    `    echo "[deep_reset:careful]   reset $ref -> $BASE"; ` +
-    `    git update-ref "$ref" "$BASE"; ` +
-    `  fi; ` +
-    `done && ` +
-    `echo "[deep_reset:careful] deleting tags/remotes/stash/notes past base..." && ` +
-    `git for-each-ref --format="%(refname)" refs | while read -r ref; do ` +
-    `  case "$ref" in refs/heads/*) continue ;; esac; ` +
-    `  if git symbolic-ref -q "$ref" >/dev/null 2>&1; then continue; fi; ` +
-    `  tip=$(git rev-parse -q --verify "$ref^{commit}" 2>/dev/null || true); ` +
-    `  [ -z "$tip" ] && continue; ` +
-    `  if [ "$tip" != "$BASE" ] && git merge-base --is-ancestor "$BASE" "$tip"; then ` +
-    `    echo "[deep_reset:careful]   delete $ref"; ` +
-    `    git update-ref -d "$ref"; ` +
-    `  fi; ` +
-    `done && ` +
-    `echo "[deep_reset:careful] removing remotes + transient refs..." && ` +
-    `for r in $(git remote); do echo "[deep_reset:careful]   rm remote $r"; git remote remove "$r"; done; ` +
-    `gd=$(git rev-parse --git-dir) && ` +
-    `rm -f "$gd"/FETCH_HEAD "$gd"/ORIG_HEAD "$gd"/MERGE_HEAD "$gd"/CHERRY_PICK_HEAD ` +
-    `"$gd"/REVERT_HEAD "$gd"/BISECT_HEAD "$gd"/AUTO_MERGE && ` +
-    `echo "[deep_reset:careful] expiring reflog + gc..." && ` +
-    `git reflog expire --expire=now --expire-unreachable=now --all && ` +
-    `git repack -ad && git prune --expire=now && git gc --prune=now && ` +
-    `git checkout -B "$ORIG_BRANCH" "$BASE" && ` +
-    `echo "[deep_reset:careful] done; HEAD=$ORIG_BRANCH at $BASE"`
-  )
-}
-
-function nuclearPass(baseCommit: string): string {
-  return (
-    `echo "[deep_reset:nuclear] careful pass failed; running batch-delete fallback" && ` +
-    `BASE=$(git rev-parse --verify ${baseCommit}^{commit}) && ` +
-    `ORIG_BRANCH=$(git symbolic-ref --short -q HEAD || echo main) && ` +
-    `echo "[deep_reset:nuclear] base=$BASE orig_branch=$ORIG_BRANCH" && ` +
-    `git checkout --detach "$BASE" && ` +
-    `for r in $(git remote); do echo "[deep_reset:nuclear]   rm remote $r"; git remote remove "$r"; done; ` +
-    `echo "[deep_reset:nuclear] batch-delete tags/remotes/stash/notes..." && ` +
-    `git for-each-ref --format="delete %(refname)" refs/tags refs/remotes refs/stash refs/notes 2>/dev/null ` +
-    `| git update-ref --stdin; ` +
-    `echo "[deep_reset:nuclear] batch-delete local branches..." && ` +
-    `git for-each-ref --format="delete %(refname)" refs/heads | git update-ref --stdin; ` +
-    `gd=$(git rev-parse --git-dir) && ` +
-    `rm -f "$gd"/FETCH_HEAD "$gd"/ORIG_HEAD "$gd"/MERGE_HEAD "$gd"/CHERRY_PICK_HEAD ` +
-    `"$gd"/REVERT_HEAD "$gd"/BISECT_HEAD "$gd"/AUTO_MERGE && ` +
-    `echo "[deep_reset:nuclear] expiring reflog + gc..." && ` +
-    `git reflog expire --expire=now --expire-unreachable=now --all && ` +
-    `git repack -ad && git prune --expire=now && git gc --prune=now && ` +
-    `git checkout -B "$ORIG_BRANCH" "$BASE" && ` +
-    `echo "[deep_reset:nuclear] done; HEAD=$ORIG_BRANCH at $BASE"`
-  )
-}
-
-export function buildDeepResetCmd(baseCommit: string): string {
-  return `( ${carefulPass(baseCommit)} ) || ( ${nuclearPass(baseCommit)} ) || true`
-}
-
 function shellQuote(s: string): string {
   return `'${s.replace(/'/g, `'\\''`)}'`
+}
+
+/**
+ * The bash body that does the actual reset. `set +e` at the top —
+ * intermediate step failures don't abort; only the terminal HEAD-check
+ * controls the exit code.
+ *
+ * Note on template-literal escaping: this string contains bash `$VAR` and
+ * `$(...)` references. Only `${...}` would be interpolated by JS — none of
+ * those exist in the shell body, so the `$` characters pass through verbatim.
+ * The single `${baseCommit}` interpolation is the caller-supplied SHA.
+ */
+export function buildDeepResetCmd(baseCommit: string): string {
+  return `set +e
+BASE=$(git rev-parse --verify ${baseCommit}^{commit}) || { echo "[deep_reset] BAD_BASE ${baseCommit}"; exit 1; }
+BRANCH=$(git symbolic-ref --short -q HEAD || echo main)
+echo "[deep_reset] BASE=$BASE BRANCH=$BRANCH"
+git reset --hard --quiet
+git clean -fd --quiet
+git checkout "$BASE" -f --quiet
+git checkout -B "$BRANCH" "$BASE" --quiet
+git for-each-ref --format='option no-deref%0Adelete %(refname)' refs/tags refs/remotes refs/stash refs/notes refs/replace refs/prefetch refs/pull 2>/dev/null | git update-ref --stdin 2>/dev/null
+git for-each-ref --format='%(refname)' refs/heads 2>/dev/null | grep -vFx "refs/heads/$BRANCH" | while read r; do git update-ref -d "$r" --no-deref 2>/dev/null; done
+rm -f .git/packed-refs
+rm -f .git/FETCH_HEAD .git/ORIG_HEAD .git/MERGE_HEAD .git/CHERRY_PICK_HEAD .git/REVERT_HEAD .git/BISECT_HEAD .git/AUTO_MERGE
+git reflog expire --expire=now --expire-unreachable=now --all 2>/dev/null
+git repack -ad --quiet 2>/dev/null
+git prune --expire=now 2>/dev/null
+git config user.email 'opencode-bench@localhost' 2>/dev/null
+git config user.name 'opencode bench' 2>/dev/null
+HEAD_SHA=$(git rev-parse --verify HEAD^{commit} 2>/dev/null)
+if [ "$HEAD_SHA" = "$BASE" ]; then
+  echo "__DEEP_RESET_OK__ HEAD=$HEAD_SHA"
+  exit 0
+else
+  echo "__DEEP_RESET_MISMATCH__ HEAD=$HEAD_SHA BASE=$BASE"
+  exit 1
+fi`
 }
 
 export async function runDeepReset(workspaceRoot: string, baseCommit: string): Promise<void> {
@@ -120,7 +104,22 @@ export async function runDeepReset(workspaceRoot: string, baseCommit: string): P
       stdio: ["ignore", "inherit", "inherit"],
     })
     child.on("close", (code) => {
-      console.log(`[bench] deep_reset exit=${code ?? 0}`)
+      const rc = code ?? 0
+      if (rc === 0) {
+        console.log(`[bench] deep_reset OK`)
+      } else {
+        // Best-effort: log LOUDLY so downstream analysis can grep for
+        // REBUILD_FAILED and filter these instances from clean-run
+        // aggregates, but do not throw — running the task on a
+        // partially-reset workspace is more useful than failing outright.
+        console.warn(
+          `[bench] REBUILD_FAILED base_commit=${baseCommit} exit_code=${rc}. ` +
+            `The workspace .git may be partially reset and may still ` +
+            `reference commits past base_commit. The agent will proceed ` +
+            `but may be able to inspect the solution via git. Filter this ` +
+            `task from clean-run analysis.`,
+        )
+      }
       resolve()
     })
     child.on("error", (err) => {
