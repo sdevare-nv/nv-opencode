@@ -149,6 +149,9 @@ async function buildConfigDir(args: {
   maxTurns: number
   systemPromptPath?: string
   enableSubagents: boolean
+  /** Forced sampling params (RL on-policy requirement); from gym llm.model config. */
+  temperature?: number
+  topP?: number
 }): Promise<{ tmpRoot: string; configFile: string }> {
   const tmpRoot = await fs.mkdtemp(path.join(os.tmpdir(), `bench-${args.instanceId}-`))
   await fs.mkdir(tmpRoot, { recursive: true })
@@ -172,6 +175,11 @@ async function buildConfigDir(args: {
           // requestTimeoutMs<=0 disables the abort timer in the provider.
           retries: Number.MAX_SAFE_INTEGER,
           requestTimeoutMs: 0,
+          // Forced sampling params: NeMo-RL's vLLM worker asserts every
+          // request's temperature/top_p match the training generation config
+          // exactly (on-policy). Passed by gym via the llm.model config block.
+          ...(args.temperature !== undefined ? { temperature: args.temperature } : {}),
+          ...(args.topP !== undefined ? { topP: args.topP } : {}),
         },
         models: {
           [args.modelName]: {
@@ -364,6 +372,9 @@ async function main() {
     unknown
   >
   const modelName = String(llmModelCfg.model ?? "unknown-model")
+  // Forced sampling params from gym (RL training on-policy requirement).
+  const forcedTemperature = typeof llmModelCfg.temperature === "number" ? llmModelCfg.temperature : undefined
+  const forcedTopP = typeof llmModelCfg.top_p === "number" ? llmModelCfg.top_p : undefined
   const baseURL = process.env.NEMO_GYM_MODEL_SERVER_BASE_URL
   if (!baseURL) throw new Error("NEMO_GYM_MODEL_SERVER_BASE_URL not set in env (gym harness sets this).")
 
@@ -382,6 +393,8 @@ async function main() {
     maxTurns: args.maxTurns,
     systemPromptPath: args.systemPromptPath,
     enableSubagents: args.enableSubagents,
+    temperature: forcedTemperature,
+    topP: forcedTopP,
   })
 
   const startedAt = Date.now()

@@ -105,6 +105,15 @@ export interface NemoGymLanguageModelConfig {
   /** Number of HTTP retry attempts on transient errors. */
   retries?: number
   /**
+   * Forced sampling params for RL training. NeMo-RL's vLLM worker asserts
+   * that every request's temperature/top_p exactly match the training
+   * generation config (on-policy requirement) — when set, these override
+   * whatever the session/agent layer picked, for ALL sessions including
+   * subagents.
+   */
+  temperature?: number
+  topP?: number
+  /**
    * Where per-call llm_completions JSONs land. The bench harness builds this
    * path; it must match what gym's host-side glob expects. If unset, no
    * trajectory dump happens (useful for dev/test).
@@ -368,8 +377,10 @@ export class NemoGymLanguageModel implements LanguageModelV3 {
     const requestParams: Record<string, unknown> = {
       messages,
       max_tokens: options.maxOutputTokens,
-      temperature: options.temperature,
-      top_p: options.topP,
+      // Forced training params (cfg) win over session/agent-level choices:
+      // NeMo-RL asserts exact temperature/top_p equality on every request.
+      temperature: this.cfg.temperature ?? options.temperature,
+      top_p: this.cfg.topP ?? options.topP,
       stop: options.stopSequences,
       seed: options.seed,
     }

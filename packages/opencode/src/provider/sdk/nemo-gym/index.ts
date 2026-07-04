@@ -29,6 +29,13 @@ export interface CreateNemoGymOptions {
   requestTimeoutMs?: number
   /** HTTP retry count on transient errors. */
   retries?: number
+  /**
+   * Forced sampling params for RL training (on-policy requirement): when set,
+   * every request carries exactly these values regardless of what the
+   * session/agent layer picked. Wired from the gym config's llm.model block.
+   */
+  temperature?: number
+  topP?: number
   /** Optional turn counter shared across all model calls in a session. */
   turnCounter?: { next(): number }
   /** Optional callback invoked after each successful chat-completion. */
@@ -54,6 +61,8 @@ export function createNemoGym(opts: CreateNemoGymOptions): NemoGymProvider {
         instanceId: opts.instanceId,
         requestTimeoutMs: opts.requestTimeoutMs,
         retries: opts.retries,
+        temperature: opts.temperature,
+        topP: opts.topP,
         turnCounter: opts.turnCounter,
         onCompletion: opts.onCompletion,
       })
