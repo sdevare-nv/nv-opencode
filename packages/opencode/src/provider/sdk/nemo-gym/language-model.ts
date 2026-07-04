@@ -199,9 +199,13 @@ export class NemoGymLanguageModel implements LanguageModelV3 {
     if (!choice) throw new Error("nemo-gym: empty choices in response")
     const msg: ChatResponseChoice["message"] = choice.message ?? ({ role: "assistant" } as ChatResponseChoice["message"])
 
+    const providerSpecificFields = this._extractProviderFields(msg)
+    const providerMetadata = this._buildProviderMetadata(providerSpecificFields)
+
     const content: LanguageModelV3Content[] = []
-    if (msg.content) content.push({ type: "text", text: msg.content })
-    if (msg.reasoning_text) content.push({ type: "reasoning", text: msg.reasoning_text })
+    // Part-level providerMetadata round-trips per-turn token IDs (see doStream).
+    if (msg.content) content.push({ type: "text", text: msg.content, providerMetadata })
+    if (msg.reasoning_text) content.push({ type: "reasoning", text: msg.reasoning_text, providerMetadata })
     if (msg.tool_calls) {
       for (const tc of msg.tool_calls) {
         content.push({
@@ -212,9 +216,6 @@ export class NemoGymLanguageModel implements LanguageModelV3 {
         })
       }
     }
-
-    const providerSpecificFields = this._extractProviderFields(msg)
-    const providerMetadata = this._buildProviderMetadata(providerSpecificFields)
 
     await this._dumpAndNotify({
       messages,
@@ -266,18 +267,22 @@ export class NemoGymLanguageModel implements LanguageModelV3 {
             timestamp: responseJson.created ? new Date(responseJson.created * 1000) : undefined,
           })
 
-          // Reasoning content.
+          // Reasoning content. providerMetadata on the *-end events is
+          // persisted by opencode's processor as part.metadata and replayed
+          // on the next request as part.providerOptions["nemo-gym"] — this is
+          // how per-turn token IDs round-trip so EVERY assistant turn (not
+          // just the last) carries them for RL training reconstruction.
           if (msg.reasoning_text) {
             controller.enqueue({ type: "reasoning-start", id: "reasoning-0" })
             controller.enqueue({ type: "reasoning-delta", id: "reasoning-0", delta: msg.reasoning_text })
-            controller.enqueue({ type: "reasoning-end", id: "reasoning-0" })
+            controller.enqueue({ type: "reasoning-end", id: "reasoning-0", providerMetadata })
           }
 
           // Text content.
           if (msg.content) {
             controller.enqueue({ type: "text-start", id: "txt-0" })
             controller.enqueue({ type: "text-delta", id: "txt-0", delta: msg.content })
-            controller.enqueue({ type: "text-end", id: "txt-0" })
+            controller.enqueue({ type: "text-end", id: "txt-0", providerMetadata })
           }
 
           // Tool calls.
@@ -358,15 +363,42 @@ export class NemoGymLanguageModel implements LanguageModelV3 {
     // tool-call / multi-content shapes map identically to the rest of opencode.
     const messages = convertToOpenAICompatibleChatMessages(options.prompt) as unknown as ChatRequestMessage[]
 
+    // Attach token IDs to the MOST RECENT assistant message only, mirroring
+    // OpenHands' nemo_gym_client.py: the last turn's prompt_token_ids embed
+    // the exact token stream of the whole conversation, which is (a) how the
+    // vllm proxy verifies continuity and avoids retokenization drift, and
+    // (b) all NeMo-RL needs to reconstruct the full episode for training.
+    // The IDs round-trip through opencode's part metadata: doStream emits
+    // providerMetadata on text-end / reasoning-end -> processor stores
+    // part.metadata -> replay attaches part.providerOptions["nemo-gym"].
+    // (The generic converter drops the fields, so we restore them here.)
+    {
+      const promptAssistants = options.prompt.filter((m) => m.role === "assistant")
+      const wireAssistants = (messages as Array<Record<string, unknown>>).filter((m) => m["role"] === "assistant")
+      const n = Math.min(promptAssistants.length, wireAssistants.length)
+      outer: for (let i = n - 1; i >= 0; i--) {
+        const parts = promptAssistants[i].content
+        if (!Array.isArray(parts)) continue
+        for (const part of parts as Array<{ providerOptions?: Record<string, Record<string, unknown>> }>) {
+          const md = part.providerOptions?.[this.provider]
+          if (md && TOKEN_ID_FIELDS.every((f) => f in md)) {
+            for (const f of TOKEN_ID_FIELDS) wireAssistants[i][f] = md[f]
+            break outer
+          }
+        }
+      }
+    }
+
     const { tools, toolChoice, toolWarnings } = prepareTools({
       tools: options.tools,
       toolChoice: options.toolChoice,
     })
     warnings.push(...toolWarnings)
 
-    // Strip token-ID fields from all assistant messages EXCEPT the most recent.
-    // Mirrors nemo_gym_client.py:85-97. Wire-payload dedup; the most recent
-    // message keeps its IDs so the server can verify continuity.
+    // Safeguard: strip token-ID fields from all assistant messages EXCEPT the
+    // most recent (mirrors nemo_gym_client.py:85-97). With the single-message
+    // attach above this is normally a no-op, but it keeps the wire contract
+    // if an upstream change ever attaches more.
     {
       let lastSeen = false
       for (let i = messages.length - 1; i >= 0; i--) {
