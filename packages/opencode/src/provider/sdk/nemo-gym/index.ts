@@ -36,6 +36,8 @@ export interface CreateNemoGymOptions {
    */
   temperature?: number
   topP?: number
+  /** Optional forced max_tokens; unset = no cap (vLLM generates to remaining context). */
+  maxTokens?: number
   /** Optional turn counter shared across all model calls in a session. */
   turnCounter?: { next(): number }
   /** Optional callback invoked after each successful chat-completion. */
@@ -63,6 +65,7 @@ export function createNemoGym(opts: CreateNemoGymOptions): NemoGymProvider {
         retries: opts.retries,
         temperature: opts.temperature,
         topP: opts.topP,
+        maxTokens: opts.maxTokens,
         turnCounter: opts.turnCounter,
         onCompletion: opts.onCompletion,
       })

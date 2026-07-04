@@ -114,6 +114,12 @@ export interface NemoGymLanguageModelConfig {
   temperature?: number
   topP?: number
   /**
+   * Optional forced max_tokens. When unset (the default), requests carry NO
+   * max_tokens and vLLM generates up to the remaining context — opencode's
+   * session-level output cap is deliberately ignored.
+   */
+  maxTokens?: number
+  /**
    * Where per-call llm_completions JSONs land. The bench harness builds this
    * path; it must match what gym's host-side glob expects. If unset, no
    * trajectory dump happens (useful for dev/test).
@@ -376,7 +382,12 @@ export class NemoGymLanguageModel implements LanguageModelV3 {
 
     const requestParams: Record<string, unknown> = {
       messages,
-      max_tokens: options.maxOutputTokens,
+      // max_tokens is intentionally OMITTED unless the gym config forces one:
+      // without it vLLM generates up to the remaining context
+      // (max_model_len - prompt), i.e. "unlimited" output. Sending opencode's
+      // session-level cap (OUTPUT_TOKEN_MAX=32k) both truncated long turns and
+      // shrank the usable input window (vLLM rejects input+max_tokens>context).
+      ...(this.cfg.maxTokens ? { max_tokens: this.cfg.maxTokens } : {}),
       // Forced training params (cfg) win over session/agent-level choices:
       // NeMo-RL asserts exact temperature/top_p equality on every request.
       temperature: this.cfg.temperature ?? options.temperature,

@@ -152,6 +152,7 @@ async function buildConfigDir(args: {
   /** Forced sampling params (RL on-policy requirement); from gym llm.model config. */
   temperature?: number
   topP?: number
+  maxTokens?: number
 }): Promise<{ tmpRoot: string; configFile: string }> {
   const tmpRoot = await fs.mkdtemp(path.join(os.tmpdir(), `bench-${args.instanceId}-`))
   await fs.mkdir(tmpRoot, { recursive: true })
@@ -180,6 +181,7 @@ async function buildConfigDir(args: {
           // exactly (on-policy). Passed by gym via the llm.model config block.
           ...(args.temperature !== undefined ? { temperature: args.temperature } : {}),
           ...(args.topP !== undefined ? { topP: args.topP } : {}),
+          ...(args.maxTokens !== undefined ? { maxTokens: args.maxTokens } : {}),
         },
         models: {
           [args.modelName]: {
@@ -375,6 +377,8 @@ async function main() {
   // Forced sampling params from gym (RL training on-policy requirement).
   const forcedTemperature = typeof llmModelCfg.temperature === "number" ? llmModelCfg.temperature : undefined
   const forcedTopP = typeof llmModelCfg.top_p === "number" ? llmModelCfg.top_p : undefined
+  // Optional: force a max_tokens cap; when absent, requests carry none (unlimited).
+  const forcedMaxTokens = typeof llmModelCfg.max_tokens === "number" ? llmModelCfg.max_tokens : undefined
   const baseURL = process.env.NEMO_GYM_MODEL_SERVER_BASE_URL
   if (!baseURL) throw new Error("NEMO_GYM_MODEL_SERVER_BASE_URL not set in env (gym harness sets this).")
 
@@ -395,6 +399,7 @@ async function main() {
     enableSubagents: args.enableSubagents,
     temperature: forcedTemperature,
     topP: forcedTopP,
+    maxTokens: forcedMaxTokens,
   })
 
   const startedAt = Date.now()
