@@ -363,6 +363,23 @@ export class NemoGymLanguageModel implements LanguageModelV3 {
     // tool-call / multi-content shapes map identically to the rest of opencode.
     const messages = convertToOpenAICompatibleChatMessages(options.prompt) as unknown as ChatRequestMessage[]
 
+    // The gym's vllm proxy (NeMoGymEasyInputMessage) only accepts plain-string
+    // content on non-assistant messages; the converter emits an ARRAY of parts
+    // for multi-part user turns (e.g. the synthetic "Attached image(s) from
+    // tool result:" message) which fails validation server-side with a 500.
+    // The policy model is text-only anyway, so flatten arrays to a single
+    // string and stub out non-text parts.
+    for (const m of messages as Array<Record<string, unknown>>) {
+      const content = m["content"]
+      if (Array.isArray(content)) {
+        m["content"] = (content as Array<Record<string, unknown>>)
+          .map((p) =>
+            p?.["type"] === "text" ? String(p["text"] ?? "") : `[${String(p?.["type"] ?? "unknown")} part omitted]`,
+          )
+          .join("\n")
+      }
+    }
+
     // Attach token IDs to the MOST RECENT assistant message only, mirroring
     // OpenHands' nemo_gym_client.py: the last turn's prompt_token_ids embed
     // the exact token stream of the whole conversation, which is (a) how the
