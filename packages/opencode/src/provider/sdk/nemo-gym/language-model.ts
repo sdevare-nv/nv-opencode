@@ -191,7 +191,7 @@ export class NemoGymLanguageModel implements LanguageModelV3 {
   // The streamText path in `session/llm.ts` only calls doStream. We still
   // implement doGenerate for completeness / future direct-use.
   async doGenerate(options: LanguageModelV3CallOptions) {
-    const { warnings, messages, requestParams } = await this._buildRequestParams(options)
+    const { warnings, loggedMessages, requestParams } = await this._buildRequestParams(options)
     const session = this._sessionFromHeaders(options.headers)
     const { responseJson } = await this._postChat(requestParams)
 
@@ -218,7 +218,7 @@ export class NemoGymLanguageModel implements LanguageModelV3 {
     }
 
     await this._dumpAndNotify({
-      messages,
+      messages: loggedMessages,
       response: responseJson,
       providerSpecificFields,
       requestParams,
@@ -237,7 +237,7 @@ export class NemoGymLanguageModel implements LanguageModelV3 {
   }
 
   async doStream(options: LanguageModelV3CallOptions) {
-    const { warnings, messages, requestParams } = await this._buildRequestParams(options)
+    const { warnings, loggedMessages, requestParams } = await this._buildRequestParams(options)
     const session = this._sessionFromHeaders(options.headers)
 
     // Fire the HTTP call eagerly so any error surfaces synchronously when the
@@ -312,7 +312,7 @@ export class NemoGymLanguageModel implements LanguageModelV3 {
           // Persist trajectory BEFORE finishing so a downstream tool crash
           // cannot lose this turn's token IDs.
           await self._dumpAndNotify({
-            messages,
+            messages: loggedMessages,
             response: responseJson,
             providerSpecificFields,
             requestParams,
@@ -354,6 +354,7 @@ export class NemoGymLanguageModel implements LanguageModelV3 {
   private async _buildRequestParams(options: LanguageModelV3CallOptions): Promise<{
     warnings: SharedV3Warning[]
     messages: ChatRequestMessage[]
+    loggedMessages: ChatRequestMessage[]
     tools: unknown
     toolChoice: unknown
     requestParams: Record<string, unknown>
@@ -380,27 +381,45 @@ export class NemoGymLanguageModel implements LanguageModelV3 {
       }
     }
 
-    // Attach token IDs to the MOST RECENT assistant message only, mirroring
-    // OpenHands' nemo_gym_client.py: the last turn's prompt_token_ids embed
-    // the exact token stream of the whole conversation, which is (a) how the
-    // vllm proxy verifies continuity and avoids retokenization drift, and
-    // (b) all NeMo-RL needs to reconstruct the full episode for training.
+    // Token-ID handling, mirroring OpenHands' nemo_gym_client.py exactly:
+    //   - WIRE request: token IDs on the MOST RECENT assistant message only
+    //     (the last turn's prompt_token_ids embed the exact token stream of
+    //     the whole conversation; the vllm proxy uses it to verify continuity
+    //     and avoid retokenization drift).
+    //   - LOGGED trajectory (llm_completions/*.json): token IDs on EVERY
+    //     assistant turn — swe_agents app.py materializes the training
+    //     episode from the logged messages, and NeMo-RL needs per-turn
+    //     generation_token_ids/log_probs to build the loss mask over all
+    //     model-generated spans, not just the final turn.
     // The IDs round-trip through opencode's part metadata: doStream emits
     // providerMetadata on text-end / reasoning-end -> processor stores
     // part.metadata -> replay attaches part.providerOptions["nemo-gym"].
     // (The generic converter drops the fields, so we restore them here.)
+    // Shallow-clone each message so wire-side attach/strip never leaks into
+    // the logged copy and vice versa.
+    const loggedMessages = (messages as Array<Record<string, unknown>>).map((m) => ({
+      ...m,
+    })) as unknown as ChatRequestMessage[]
     {
       const promptAssistants = options.prompt.filter((m) => m.role === "assistant")
       const wireAssistants = (messages as Array<Record<string, unknown>>).filter((m) => m["role"] === "assistant")
+      const loggedAssistants = (loggedMessages as unknown as Array<Record<string, unknown>>).filter(
+        (m) => m["role"] === "assistant",
+      )
       const n = Math.min(promptAssistants.length, wireAssistants.length)
-      outer: for (let i = n - 1; i >= 0; i--) {
+      let mostRecentAttached = false
+      for (let i = n - 1; i >= 0; i--) {
         const parts = promptAssistants[i].content
         if (!Array.isArray(parts)) continue
         for (const part of parts as Array<{ providerOptions?: Record<string, Record<string, unknown>> }>) {
           const md = part.providerOptions?.[this.provider]
           if (md && TOKEN_ID_FIELDS.every((f) => f in md)) {
-            for (const f of TOKEN_ID_FIELDS) wireAssistants[i][f] = md[f]
-            break outer
+            for (const f of TOKEN_ID_FIELDS) loggedAssistants[i][f] = md[f]
+            if (!mostRecentAttached) {
+              for (const f of TOKEN_ID_FIELDS) wireAssistants[i][f] = md[f]
+              mostRecentAttached = true
+            }
+            break
           }
         }
       }
@@ -462,7 +481,7 @@ export class NemoGymLanguageModel implements LanguageModelV3 {
       if (requestParams[k] === undefined) delete requestParams[k]
     }
 
-    return { warnings, messages, tools, toolChoice, requestParams }
+    return { warnings, messages, loggedMessages, tools, toolChoice, requestParams }
   }
 
   private async _postChat(params: Record<string, unknown>): Promise<{ responseJson: ChatResponse }> {
