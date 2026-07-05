@@ -1569,7 +1569,11 @@ NOTE: At any point in time through this workflow you should feel free to ask the
               sys.skills(agent),
               sys.environment(model),
               instruction.system().pipe(Effect.orDie),
-              MessageV2.toModelMessagesEffect(msgs, model),
+              // stripMedia: the policy model is text-only; dropping media
+              // attachments here prevents the synthetic "Attached image(s)
+              // from tool result:" user message (multi-part content the gym
+              // vllm proxy rejects) from ever being injected.
+              MessageV2.toModelMessagesEffect(msgs, model, { stripMedia: true }),
             ])
             const system = [...env, ...instructions, ...(skills ? [skills] : [])]
             const format = lastUser.format ?? { type: "text" as const }
