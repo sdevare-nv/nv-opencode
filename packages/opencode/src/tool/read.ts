@@ -219,25 +219,17 @@ export const ReadTool = Tool.define(
       const mime = sniffAttachmentMime(sample, AppFileSystem.mimeType(filepath))
       const isImage = SUPPORTED_IMAGE_MIMES.has(mime)
 
+      // Media input is disabled in this harness: the policy model is
+      // text-only, so image/PDF attachments would only produce a synthetic
+      // multi-part user message the gym's vllm proxy can't accept (and a
+      // base64 blob in session storage). Fail with a clear error so the
+      // agent moves on instead of retrying.
       if (isImage || isPdfAttachment(mime)) {
-        const bytes = yield* fs.readFile(filepath)
-        const msg = isPdfAttachment(mime) ? "PDF read successfully" : "Image read successfully"
-        return {
-          title,
-          output: msg,
-          metadata: {
-            preview: msg,
-            truncated: false,
-            loaded: loaded.map((item) => item.filepath),
-          },
-          attachments: [
-            {
-              type: "file" as const,
-              mime,
-              url: `data:${mime};base64,${Buffer.from(bytes).toString("base64")}`,
-            },
-          ],
-        }
+        return yield* Effect.fail(
+          new Error(
+            `Cannot read ${isPdfAttachment(mime) ? "PDF" : "image"} file: ${filepath} (media input is not supported by this model)`,
+          ),
+        )
       }
 
       if (isBinaryFile(filepath, sample)) {
