@@ -120,41 +120,50 @@ const cli = yargs(args)
       run_id: processMetadata.runID,
     })
 
-    const marker = path.join(Global.Path.data, "opencode.db")
-    if (!(await Filesystem.exists(marker))) {
-      const tty = process.stderr.isTTY
-      process.stderr.write("Performing one time database migration, may take a few minutes..." + EOL)
-      const width = 36
-      const orange = "\x1b[38;5;214m"
-      const muted = "\x1b[0;2m"
-      const reset = "\x1b[0m"
-      let last = -1
-      if (tty) process.stderr.write("\x1b[?25l")
-      try {
-        await JsonMigration.run(drizzle({ client: Database.Client().$client }), {
-          progress: (event) => {
-            const percent = Math.floor((event.current / event.total) * 100)
-            if (percent === last && event.current !== event.total) return
-            last = percent
-            if (tty) {
-              const fill = Math.round((percent / 100) * width)
-              const bar = `${"■".repeat(fill)}${"･".repeat(width - fill)}`
-              process.stderr.write(
-                `\r${orange}${bar} ${percent.toString().padStart(3)}%${reset} ${muted}${event.label.padEnd(12)} ${event.current}/${event.total}${reset}`,
-              )
-              if (event.current === event.total) process.stderr.write("\n")
-            } else {
-              process.stderr.write(`sqlite-migration:${percent}${EOL}`)
-            }
-          },
-        })
-      } finally {
-        if (tty) process.stderr.write("\x1b[?25h")
-        else {
-          process.stderr.write(`sqlite-migration:done${EOL}`)
+    // In-memory DBs (bench/CI harnesses set OPENCODE_DB=:memory:, see
+    // bench/cli.ts) start empty every process and never persist a marker
+    // file, so the on-disk marker check below would always be absent and
+    // this "one time" migration would actually re-run — as a no-op, since
+    // there's no legacy JSON storage dir to migrate either, but still
+    // costing a Database.Client() open + filesystem glob — on every single
+    // invocation instead of truly once.
+    if (Database.Path !== ":memory:") {
+      const marker = path.join(Global.Path.data, "opencode.db")
+      if (!(await Filesystem.exists(marker))) {
+        const tty = process.stderr.isTTY
+        process.stderr.write("Performing one time database migration, may take a few minutes..." + EOL)
+        const width = 36
+        const orange = "\x1b[38;5;214m"
+        const muted = "\x1b[0;2m"
+        const reset = "\x1b[0m"
+        let last = -1
+        if (tty) process.stderr.write("\x1b[?25l")
+        try {
+          await JsonMigration.run(drizzle({ client: Database.Client().$client }), {
+            progress: (event) => {
+              const percent = Math.floor((event.current / event.total) * 100)
+              if (percent === last && event.current !== event.total) return
+              last = percent
+              if (tty) {
+                const fill = Math.round((percent / 100) * width)
+                const bar = `${"■".repeat(fill)}${"･".repeat(width - fill)}`
+                process.stderr.write(
+                  `\r${orange}${bar} ${percent.toString().padStart(3)}%${reset} ${muted}${event.label.padEnd(12)} ${event.current}/${event.total}${reset}`,
+                )
+                if (event.current === event.total) process.stderr.write("\n")
+              } else {
+                process.stderr.write(`sqlite-migration:${percent}${EOL}`)
+              }
+            },
+          })
+        } finally {
+          if (tty) process.stderr.write("\x1b[?25h")
+          else {
+            process.stderr.write(`sqlite-migration:done${EOL}`)
+          }
         }
+        process.stderr.write("Database migration complete." + EOL)
       }
-      process.stderr.write("Database migration complete." + EOL)
     }
   })
   .usage("")

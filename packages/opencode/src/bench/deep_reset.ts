@@ -102,7 +102,19 @@ function shellQuote(s: string): string {
   return `'${s.replace(/'/g, `'\\''`)}'`
 }
 
-export async function runDeepReset(workspaceRoot: string, baseCommit: string): Promise<void> {
+// Default budget for the whole deep-reset pipeline (checkout, ref rewrite,
+// reflog expire, repack, gc, prune). This is plain git plumbing that should
+// finish in seconds even on large repos; the timeout exists so a stuck git
+// process (lock contention, a pathological repo) can't silently burn the
+// entire per-instance agent timeout before a single LLM call happens.
+const DEFAULT_TIMEOUT_MS = 10 * 60_000
+const KILL_GRACE_MS = 10_000
+
+export async function runDeepReset(
+  workspaceRoot: string,
+  baseCommit: string,
+  timeoutMs = Number(process.env.OPENCODE_DEEP_RESET_TIMEOUT_MS) || DEFAULT_TIMEOUT_MS,
+): Promise<void> {
   if (!baseCommit) return
   const shell = detectShell()
   if (!shell) {
@@ -114,16 +126,42 @@ export async function runDeepReset(workspaceRoot: string, baseCommit: string): P
   // ENOENTs whenever a `cwd` is set (libc lacks addchdir_np extension); routing
   // the chdir through the shell sidesteps that entirely.
   const cmd = `cd ${shellQuote(workspaceRoot)} && ` + buildDeepResetCmd(baseCommit)
-  console.log(`[bench] deep_reset workspace=${workspaceRoot} base=${baseCommit} shell=${shell}`)
+  console.log(`[bench] deep_reset workspace=${workspaceRoot} base=${baseCommit} shell=${shell} timeout_ms=${timeoutMs}`)
   await new Promise<void>((resolve) => {
+    // detached: true puts the shell in its own process group so a timeout
+    // can kill the whole tree (git repack/gc children included) via the
+    // negative-PID group signal — killing just the top-level bash leaves
+    // orphaned git children running, silently eating the rest of the budget.
     const child = spawn(shell, ["-c", cmd], {
       stdio: ["ignore", "inherit", "inherit"],
+      detached: true,
     })
+    const killTree = (signal: NodeJS.Signals) => {
+      try {
+        if (child.pid) process.kill(-child.pid, signal)
+        else child.kill(signal)
+      } catch {
+        // Group already gone (process exited between the timer firing and here).
+      }
+    }
+    let killTimer: ReturnType<typeof setTimeout> | undefined
+    const timeoutTimer = setTimeout(() => {
+      console.warn(`[bench] deep_reset exceeded ${timeoutMs}ms; sending SIGTERM`)
+      killTree("SIGTERM")
+      killTimer = setTimeout(() => {
+        console.warn(`[bench] deep_reset still alive ${KILL_GRACE_MS}ms after SIGTERM; sending SIGKILL`)
+        killTree("SIGKILL")
+      }, KILL_GRACE_MS)
+    }, timeoutMs)
     child.on("close", (code) => {
+      clearTimeout(timeoutTimer)
+      clearTimeout(killTimer)
       console.log(`[bench] deep_reset exit=${code ?? 0}`)
       resolve()
     })
     child.on("error", (err) => {
+      clearTimeout(timeoutTimer)
+      clearTimeout(killTimer)
       console.warn(`[bench] deep_reset spawn error: ${err}`)
       resolve()
     })
