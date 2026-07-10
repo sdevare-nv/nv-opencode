@@ -9,7 +9,7 @@
  * provider plumbing (Provider.Service.getModel) works without special-casing.
  */
 
-import { NemoGymLanguageModel, type NemoGymLanguageModelConfig } from "./language-model"
+import { NemoGymLanguageModel, type NemoGymLanguageModelConfig, type NemoGymReplayTurn } from "./language-model"
 
 export interface CreateNemoGymOptions {
   /** Base URL of the gym model server (`http://host:port`). */
@@ -42,6 +42,12 @@ export interface CreateNemoGymOptions {
   turnCounter?: { next(): number }
   /** Optional callback invoked after each successful chat-completion. */
   onCompletion?: NemoGymLanguageModelConfig["onCompletion"]
+  /**
+   * Scripted assistant turns to replay (main session only) before falling
+   * through to live HTTP calls. Set by the bench harness when the request
+   * carries a prior trajectory to resume. See language-model.ts's docblock.
+   */
+  replayTurns?: NemoGymReplayTurn[]
 }
 
 export interface NemoGymProvider {
@@ -68,6 +74,7 @@ export function createNemoGym(opts: CreateNemoGymOptions): NemoGymProvider {
         maxTokens: opts.maxTokens,
         turnCounter: opts.turnCounter,
         onCompletion: opts.onCompletion,
+        replayTurns: opts.replayTurns,
       })
     },
   }

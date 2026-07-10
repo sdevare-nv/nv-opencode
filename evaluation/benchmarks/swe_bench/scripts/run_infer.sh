@@ -14,6 +14,8 @@
 #   $10 WORKSPACE_ROOT     resolved repo path inside the SIF (gym side decided)
 #   $11 USER_MESSAGE_PATH  pre-rendered user prompt file (workspace baked in)
 #   $12 SYSTEM_PROMPT_PATH optional system-prompt override
+#   $13 REPLAY_MESSAGES_PATH optional JSON file of prior chat-completion
+#                          messages to replay before continuing live
 #
 # Environment (set by gym):
 #   NEMO_GYM_MODEL_SERVER_NAME      proxy name on the gym head server
@@ -38,6 +40,7 @@ CONFIG_FILE="${9:-/tmp/oc_config.json}"
 WORKSPACE_ROOT="${10:-}"
 USER_MESSAGE_PATH="${11:-}"
 SYSTEM_PROMPT_PATH="${12:-}"
+REPLAY_MESSAGES_PATH="${13:-}"
 
 if [ -z "$SELECTED_ID" ]; then
     echo "ERROR: SELECTED_ID (\$7) is required."
@@ -92,6 +95,7 @@ echo "CONFIG_FILE: $CONFIG_FILE"
 echo "WORKSPACE_ROOT: $WORKSPACE_ROOT"
 echo "USER_MESSAGE_PATH: $USER_MESSAGE_PATH"
 echo "SYSTEM_PROMPT_PATH: $SYSTEM_PROMPT_PATH"
+echo "REPLAY_MESSAGES_PATH: $REPLAY_MESSAGES_PATH"
 echo "MODEL_SERVER: $NEMO_GYM_MODEL_SERVER_NAME @ $NEMO_GYM_MODEL_SERVER_BASE_URL"
 
 cmd=(
@@ -109,6 +113,9 @@ cmd=(
 )
 if [ -n "$SYSTEM_PROMPT_PATH" ]; then
     cmd+=(--system-prompt "$SYSTEM_PROMPT_PATH")
+fi
+if [ -n "$REPLAY_MESSAGES_PATH" ]; then
+    cmd+=(--replay-messages-file "$REPLAY_MESSAGES_PATH")
 fi
 if [ "${ENABLE_SUBAGENTS:-0}" = "1" ] || [ "${ENABLE_SUBAGENTS:-}" = "true" ]; then
     cmd+=(--enable-subagents)

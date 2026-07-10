@@ -17,6 +17,22 @@
  * so a tool crash later cannot lose this turn's token IDs. The shape matches
  * openhands' `llm_completions/<id>/*.json` exactly so gym's
  * `get_openhands_trajectory_from_completions` reads it without changes.
+ *
+ * Replay: when `cfg.replayTurns` is set, the first N calls (main session
+ * only) are answered from that scripted queue instead of a real HTTP call —
+ * same synthesized-stream shape as a real response, so opencode's *real*
+ * tool-execution path (streamText -> the AI-SDK `tool.execute` closures
+ * built in session/prompt.ts's resolveTools()) runs each replayed tool call
+ * for real against the live sandbox. This is required for correctness:
+ * SWE-bench agents mutate a git workspace and the final patch comes from
+ * `git diff`, so a replayed "edit"/"bash" call must actually happen on the
+ * fresh container, not just be asserted via stale recorded output text.
+ * Once the queue is exhausted, doStream/doGenerate fall through unchanged to
+ * the real HTTP path and the agent continues live. Scripted turns are never
+ * dumped to completionsDir: gym derives the replay/live boundary from the
+ * FIRST dumped completion's cumulative `messages` length, which must be the
+ * first live call (by then the replay prefix is already in session
+ * history), not a scripted one.
  */
 
 import {
@@ -91,6 +107,12 @@ interface ChatResponse {
 
 const TOKEN_ID_FIELDS = ["prompt_token_ids", "generation_token_ids", "generation_log_probs"] as const
 
+/** A single scripted assistant turn to replay before falling through to live model calls. */
+export interface NemoGymReplayTurn {
+  content: string | null
+  toolCalls?: Array<{ id: string; name: string; arguments: string }>
+}
+
 export interface NemoGymLanguageModelConfig {
   /** Provider id used to namespace providerMetadata. Defaults to "nemo-gym". */
   provider: string
@@ -137,6 +159,12 @@ export interface NemoGymLanguageModelConfig {
     providerSpecificFields: Record<string, unknown>
     requestParams: Record<string, unknown>
   }) => void | Promise<void>
+  /**
+   * Scripted assistant turns to replay (main session only) before falling
+   * through to live HTTP calls. See the module docblock for why replayed
+   * tool calls must run for real rather than just replaying recorded text.
+   */
+  replayTurns?: NemoGymReplayTurn[]
 }
 
 // ---------------------------------------------------------------------------
@@ -154,6 +182,9 @@ export class NemoGymLanguageModel implements LanguageModelV3 {
   // subagents spawned via the task tool get their own sessionID, so keeping
   // a Map keeps their dump filenames from clobbering the main session's.
   private readonly turnCounters: Map<string, number> = new Map()
+  // Replay only ever applies to the main session (subagent sessions never
+  // existed in the recorded trajectory) — a single counter is sufficient.
+  private replayIndex = 0
 
   constructor(modelId: string, cfg: NemoGymLanguageModelConfig) {
     this.modelId = modelId
@@ -184,6 +215,86 @@ export class NemoGymLanguageModel implements LanguageModelV3 {
     return { sessionID: sid || "main", parentSessionID: pid }
   }
 
+  // Pops the next scripted turn for the main session, or undefined once the
+  // replay queue is exhausted / not applicable (subagent sessions, no
+  // replayTurns configured). Advances state, so call at most once per doStream
+  // / doGenerate invocation.
+  private _popReplayTurn(session: { sessionID: string }): NemoGymReplayTurn | undefined {
+    if (!this.cfg.replayTurns) return undefined
+    if (session.sessionID !== "main") return undefined
+    if (this.replayIndex >= this.cfg.replayTurns.length) return undefined
+    return this.cfg.replayTurns[this.replayIndex++]
+  }
+
+  private _messageFromReplayTurn(turn: NemoGymReplayTurn): ChatResponseChoice["message"] {
+    return {
+      role: "assistant",
+      content: turn.content,
+      tool_calls: turn.toolCalls?.map((tc) => ({
+        id: tc.id,
+        type: "function" as const,
+        function: { name: tc.name, arguments: tc.arguments },
+      })),
+    }
+  }
+
+  private _replayFinishReason(turn: NemoGymReplayTurn): string {
+    return turn.toolCalls && turn.toolCalls.length > 0 ? "tool_calls" : "stop"
+  }
+
+  // Shared by the real HTTP path and the replay path so both stay in sync:
+  // reasoning -> text -> tool-call stream parts for one assistant turn.
+  private _enqueueMessageParts(
+    controller: ReadableStreamDefaultController<LanguageModelV3StreamPart>,
+    msg: Pick<ChatResponseChoice["message"], "content" | "reasoning_text" | "tool_calls">,
+    providerMetadata: SharedV3ProviderMetadata,
+  ) {
+    // Reasoning content. providerMetadata on the *-end events is persisted by
+    // opencode's processor as part.metadata and replayed on the next request
+    // as part.providerOptions["nemo-gym"] — this is how per-turn token IDs
+    // round-trip so EVERY assistant turn (not just the last) carries them for
+    // RL training reconstruction. Replay turns carry no token IDs (empty
+    // providerMetadata), which is fine — gym never reads a dump for them.
+    if (msg.reasoning_text) {
+      controller.enqueue({ type: "reasoning-start", id: "reasoning-0" })
+      controller.enqueue({ type: "reasoning-delta", id: "reasoning-0", delta: msg.reasoning_text })
+      controller.enqueue({ type: "reasoning-end", id: "reasoning-0", providerMetadata })
+    }
+
+    // Text content.
+    if (msg.content) {
+      controller.enqueue({ type: "text-start", id: "txt-0" })
+      controller.enqueue({ type: "text-delta", id: "txt-0", delta: msg.content })
+      controller.enqueue({ type: "text-end", id: "txt-0", providerMetadata })
+    }
+
+    // Tool calls. Replayed tool-call IDs are reused verbatim (see
+    // _messageFromReplayTurn) so gym's replay/live boundary matching by
+    // call_id still lines up.
+    if (msg.tool_calls) {
+      for (const tc of msg.tool_calls) {
+        const tcId = tc.id ?? `call_${Math.random().toString(36).slice(2, 10)}`
+        controller.enqueue({
+          type: "tool-input-start",
+          id: tcId,
+          toolName: tc.function.name,
+        })
+        controller.enqueue({
+          type: "tool-input-delta",
+          id: tcId,
+          delta: tc.function.arguments,
+        })
+        controller.enqueue({ type: "tool-input-end", id: tcId })
+        controller.enqueue({
+          type: "tool-call",
+          toolCallId: tcId,
+          toolName: tc.function.name,
+          input: tc.function.arguments,
+        })
+      }
+    }
+  }
+
   get supportedUrls() {
     return {} as Record<string, RegExp[]>
   }
@@ -191,8 +302,36 @@ export class NemoGymLanguageModel implements LanguageModelV3 {
   // The streamText path in `session/llm.ts` only calls doStream. We still
   // implement doGenerate for completeness / future direct-use.
   async doGenerate(options: LanguageModelV3CallOptions) {
-    const { warnings, loggedMessages, requestParams } = await this._buildRequestParams(options)
     const session = this._sessionFromHeaders(options.headers)
+    const replayTurn = this._popReplayTurn(session)
+
+    if (replayTurn) {
+      const msg = this._messageFromReplayTurn(replayTurn)
+      const providerMetadata = this._buildProviderMetadata({})
+      const content: LanguageModelV3Content[] = []
+      if (msg.content) content.push({ type: "text", text: msg.content, providerMetadata })
+      if (msg.tool_calls) {
+        for (const tc of msg.tool_calls) {
+          content.push({
+            type: "tool-call",
+            toolCallId: tc.id ?? `call_${Math.random().toString(36).slice(2, 10)}`,
+            toolName: tc.function.name,
+            input: tc.function.arguments,
+          })
+        }
+      }
+      return {
+        content,
+        finishReason: this._mapFinishReason(this._replayFinishReason(replayTurn)),
+        usage: this._mapUsage(undefined),
+        providerMetadata,
+        request: { body: "{}" },
+        response: { body: {} },
+        warnings: [],
+      }
+    }
+
+    const { warnings, loggedMessages, requestParams } = await this._buildRequestParams(options)
     const { responseJson } = await this._postChat(requestParams)
 
     const choice = responseJson.choices[0]
@@ -237,8 +376,34 @@ export class NemoGymLanguageModel implements LanguageModelV3 {
   }
 
   async doStream(options: LanguageModelV3CallOptions) {
-    const { warnings, loggedMessages, requestParams } = await this._buildRequestParams(options)
     const session = this._sessionFromHeaders(options.headers)
+    const replayTurn = this._popReplayTurn(session)
+
+    if (replayTurn) {
+      const msg = this._messageFromReplayTurn(replayTurn)
+      const finishReasonRaw = this._replayFinishReason(replayTurn)
+      const self = this
+      const stream = new ReadableStream<LanguageModelV3StreamPart>({
+        start(controller) {
+          controller.enqueue({ type: "stream-start", warnings: [] })
+          const providerMetadata = self._buildProviderMetadata({})
+          self._enqueueMessageParts(controller, msg, providerMetadata)
+          // No _dumpAndNotify here — see the module docblock: gym derives the
+          // replay/live boundary from the FIRST dumped completion, which must
+          // be the first live call.
+          controller.enqueue({
+            type: "finish",
+            finishReason: self._mapFinishReason(finishReasonRaw),
+            usage: self._mapUsage(undefined),
+            providerMetadata,
+          })
+          controller.close()
+        },
+      })
+      return { stream, request: { body: "{}" }, response: {} }
+    }
+
+    const { warnings, loggedMessages, requestParams } = await this._buildRequestParams(options)
 
     // Fire the HTTP call eagerly so any error surfaces synchronously when the
     // stream is consumed. We then synthesize parts in `start`.
@@ -267,47 +432,7 @@ export class NemoGymLanguageModel implements LanguageModelV3 {
             timestamp: responseJson.created ? new Date(responseJson.created * 1000) : undefined,
           })
 
-          // Reasoning content. providerMetadata on the *-end events is
-          // persisted by opencode's processor as part.metadata and replayed
-          // on the next request as part.providerOptions["nemo-gym"] — this is
-          // how per-turn token IDs round-trip so EVERY assistant turn (not
-          // just the last) carries them for RL training reconstruction.
-          if (msg.reasoning_text) {
-            controller.enqueue({ type: "reasoning-start", id: "reasoning-0" })
-            controller.enqueue({ type: "reasoning-delta", id: "reasoning-0", delta: msg.reasoning_text })
-            controller.enqueue({ type: "reasoning-end", id: "reasoning-0", providerMetadata })
-          }
-
-          // Text content.
-          if (msg.content) {
-            controller.enqueue({ type: "text-start", id: "txt-0" })
-            controller.enqueue({ type: "text-delta", id: "txt-0", delta: msg.content })
-            controller.enqueue({ type: "text-end", id: "txt-0", providerMetadata })
-          }
-
-          // Tool calls.
-          if (msg.tool_calls) {
-            for (const tc of msg.tool_calls) {
-              const tcId = tc.id ?? `call_${Math.random().toString(36).slice(2, 10)}`
-              controller.enqueue({
-                type: "tool-input-start",
-                id: tcId,
-                toolName: tc.function.name,
-              })
-              controller.enqueue({
-                type: "tool-input-delta",
-                id: tcId,
-                delta: tc.function.arguments,
-              })
-              controller.enqueue({ type: "tool-input-end", id: tcId })
-              controller.enqueue({
-                type: "tool-call",
-                toolCallId: tcId,
-                toolName: tc.function.name,
-                input: tc.function.arguments,
-              })
-            }
-          }
+          self._enqueueMessageParts(controller, msg, providerMetadata)
 
           // Persist trajectory BEFORE finishing so a downstream tool crash
           // cannot lose this turn's token IDs.
