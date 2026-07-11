@@ -48,6 +48,8 @@ export interface CreateNemoGymOptions {
    * carries a prior trajectory to resume. See language-model.ts's docblock.
    */
   replayTurns?: NemoGymReplayTurn[]
+  /** Subsequent user messages trailing the last replayed turn. See language-model.ts's docblock. */
+  replayTrailingUserTexts?: string[]
 }
 
 export interface NemoGymProvider {
@@ -75,6 +77,7 @@ export function createNemoGym(opts: CreateNemoGymOptions): NemoGymProvider {
         turnCounter: opts.turnCounter,
         onCompletion: opts.onCompletion,
         replayTurns: opts.replayTurns,
+        replayTrailingUserTexts: opts.replayTrailingUserTexts,
       })
     },
   }

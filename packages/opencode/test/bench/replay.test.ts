@@ -32,7 +32,7 @@ describe("parseReplayMessages", () => {
     expect(replayTurns).toEqual([])
   })
 
-  test("skips system, tool, and subsequent user messages", () => {
+  test("skips system and tool messages", () => {
     const raw = JSON.stringify([
       { role: "system", content: "sys prompt" },
       { role: "user", content: "fix the bug" },
@@ -42,7 +42,6 @@ describe("parseReplayMessages", () => {
         tool_calls: [{ id: "call_1", type: "function", function: { name: "bash", arguments: '{"cmd":"ls"}' } }],
       },
       { role: "tool", content: "file1.py\n", tool_call_id: "call_1" },
-      { role: "user", content: "please continue" },
       { role: "assistant", content: "Done.", tool_calls: undefined },
     ])
     const { initialUserText, replayTurns } = parseReplayMessages(raw)
@@ -51,6 +50,67 @@ describe("parseReplayMessages", () => {
       { content: null, toolCalls: [{ id: "call_1", name: "bash", arguments: '{"cmd":"ls"}' }] },
       { content: "Done.", toolCalls: undefined },
     ])
+  })
+
+  test("attaches a subsequent user message to the turn it precedes, not dropped", () => {
+    const raw = JSON.stringify([
+      { role: "user", content: "fix the bug" },
+      {
+        role: "assistant",
+        content: null,
+        tool_calls: [{ id: "call_1", type: "function", function: { name: "bash", arguments: '{"cmd":"ls"}' } }],
+      },
+      { role: "tool", content: "file1.py\n", tool_call_id: "call_1" },
+      { role: "user", content: "please also fix the other bug" },
+      { role: "assistant", content: "Done.", tool_calls: undefined },
+    ])
+    const { initialUserText, replayTurns } = parseReplayMessages(raw)
+    expect(initialUserText).toBe("fix the bug")
+    expect(replayTurns).toEqual([
+      { content: null, toolCalls: [{ id: "call_1", name: "bash", arguments: '{"cmd":"ls"}' }] },
+      { content: "Done.", toolCalls: undefined, precedingUserTexts: ["please also fix the other bug"] },
+    ])
+  })
+
+  test("collects multiple consecutive subsequent user messages onto the same turn, in order", () => {
+    const raw = JSON.stringify([
+      { role: "user", content: "fix the bug" },
+      { role: "assistant", content: "ok" },
+      { role: "user", content: "also do X" },
+      { role: "user", content: "and Y" },
+      { role: "assistant", content: "done" },
+    ])
+    const { replayTurns } = parseReplayMessages(raw)
+    expect(replayTurns[1].precedingUserTexts).toEqual(["also do X", "and Y"])
+  })
+
+  test("returns trailing user messages separately when the trajectory ends on a user turn", () => {
+    const raw = JSON.stringify([
+      { role: "user", content: "fix the bug" },
+      {
+        role: "assistant",
+        content: null,
+        tool_calls: [{ id: "call_1", type: "function", function: { name: "bash", arguments: '{"cmd":"ls"}' } }],
+      },
+      { role: "tool", content: "file1.py\n", tool_call_id: "call_1" },
+      { role: "user", content: "now also check the tests" },
+    ])
+    const { replayTurns, trailingUserTexts } = parseReplayMessages(raw)
+    expect(replayTurns).toEqual([
+      { content: null, toolCalls: [{ id: "call_1", name: "bash", arguments: '{"cmd":"ls"}' }] },
+    ])
+    expect(trailingUserTexts).toEqual(["now also check the tests"])
+  })
+
+  test("omits empty subsequent user message text", () => {
+    const raw = JSON.stringify([
+      { role: "user", content: "fix the bug" },
+      { role: "assistant", content: "ok" },
+      { role: "user", content: "" },
+      { role: "assistant", content: "done" },
+    ])
+    const { replayTurns } = parseReplayMessages(raw)
+    expect(replayTurns[1].precedingUserTexts).toBeUndefined()
   })
 
   test("preserves tool_call ids verbatim, including multiple calls in one turn", () => {

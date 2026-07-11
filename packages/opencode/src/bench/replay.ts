@@ -4,11 +4,26 @@
  * without triggering `cli.ts`'s top-level `main()` (which calls
  * `process.exit` on missing/invalid CLI args — not test-friendly).
  *
- * Mirrors OpenHands' `messages_to_replay_events()` skip rules (see
- * `temp/nv-OpenHands/evaluation/benchmarks/swe_bench/replay_utils.py`):
- * system / tool / subsequent-user messages are skipped — the first user
- * message becomes the task instruction, assistant messages become scripted
- * turns replayed in order by the nemo-gym provider (see language-model.ts).
+ * The first user message becomes the task instruction, assistant messages
+ * become scripted turns replayed in order by the nemo-gym provider (see
+ * language-model.ts). System / tool messages are skipped — system content is
+ * handled separately (pinned as the agent's system prompt by gym), and tool
+ * output is regenerated fresh by actually re-executing each replayed tool
+ * call against the sandbox, not replayed from recorded text.
+ *
+ * A *subsequent* user message (anything after the first) is real request
+ * content — everything the caller sent must be part of what the model sees.
+ * Unlike assistant/tool content it isn't reconstructed by replaying it
+ * through the agent loop (it's inert text, not an action), so each one is
+ * attached to the replay turn it immediately precedes as `precedingUserTexts`
+ * (or, if it trails the very last replayed turn with nothing recorded after
+ * it, returned separately as `trailingUserTexts`). `NemoGymLanguageModel`
+ * splices these into the outgoing message list on every live model call from
+ * the first one onward — they're not persisted in opencode's own session
+ * storage (there's no cheap way to do that without restructuring the bench
+ * harness to drive multiple `session.prompt()` calls against one long-lived,
+ * disk-backed session), so the provider re-applies them on every request
+ * instead of relying on session history to carry them forward.
  */
 
 import type { NemoGymReplayTurn } from "../provider/sdk/nemo-gym/language-model"
@@ -30,23 +45,38 @@ export function replayMessageText(content: ReplayChatMessage["content"]): string
   return ""
 }
 
-export function parseReplayMessages(raw: string): { initialUserText: string; replayTurns: NemoGymReplayTurn[] } {
+export interface ParsedReplay {
+  initialUserText: string
+  replayTurns: NemoGymReplayTurn[]
+  /** Subsequent user messages after the last replayed assistant turn (trajectory ends on a user message). */
+  trailingUserTexts?: string[]
+}
+
+export function parseReplayMessages(raw: string): ParsedReplay {
   const messages = JSON.parse(raw) as ReplayChatMessage[]
 
   let initialUserText: string | undefined
   const replayTurns: NemoGymReplayTurn[] = []
+  let pendingUserTexts: string[] = []
 
   for (const msg of messages) {
     if (msg.role === "system" || msg.role === "tool") continue
     if (msg.role === "user") {
-      if (initialUserText === undefined) initialUserText = replayMessageText(msg.content)
+      const text = replayMessageText(msg.content)
+      if (initialUserText === undefined) {
+        initialUserText = text
+      } else if (text) {
+        pendingUserTexts.push(text)
+      }
       continue
     }
     if (msg.role === "assistant") {
       replayTurns.push({
         content: typeof msg.content === "string" ? msg.content : replayMessageText(msg.content) || null,
         toolCalls: msg.tool_calls?.map((tc) => ({ id: tc.id, name: tc.function.name, arguments: tc.function.arguments })),
+        ...(pendingUserTexts.length ? { precedingUserTexts: pendingUserTexts } : {}),
       })
+      pendingUserTexts = []
     }
   }
 
@@ -54,5 +84,9 @@ export function parseReplayMessages(raw: string): { initialUserText: string; rep
     throw new Error("replay-messages-file: no user message found (expected at least one task-instruction message)")
   }
 
-  return { initialUserText, replayTurns }
+  return {
+    initialUserText,
+    replayTurns,
+    ...(pendingUserTexts.length ? { trailingUserTexts: pendingUserTexts } : {}),
+  }
 }

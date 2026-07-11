@@ -165,6 +165,8 @@ async function buildConfigDir(args: {
   maxTokens?: number
   /** Scripted assistant turns to replay before the agent continues live. */
   replayTurns?: NemoGymReplayTurn[]
+  /** Subsequent user messages trailing the last replayed turn. */
+  replayTrailingUserTexts?: string[]
 }): Promise<{ tmpRoot: string; configFile: string }> {
   const tmpRoot = await fs.mkdtemp(path.join(os.tmpdir(), `bench-${args.instanceId}-`))
   await fs.mkdir(tmpRoot, { recursive: true })
@@ -195,6 +197,9 @@ async function buildConfigDir(args: {
           ...(args.topP !== undefined ? { topP: args.topP } : {}),
           ...(args.maxTokens !== undefined ? { maxTokens: args.maxTokens } : {}),
           ...(args.replayTurns?.length ? { replayTurns: args.replayTurns } : {}),
+          ...(args.replayTrailingUserTexts?.length
+            ? { replayTrailingUserTexts: args.replayTrailingUserTexts }
+            : {}),
         },
         models: {
           [args.modelName]: {
@@ -432,11 +437,13 @@ async function main() {
   // replays them (re-executing tool calls for real) before continuing live.
   let userPrompt: string
   let replayTurns: NemoGymReplayTurn[] | undefined
+  let replayTrailingUserTexts: string[] | undefined
   if (args.replayMessagesFile) {
     const raw = await fs.readFile(args.replayMessagesFile, "utf8")
     const parsed = parseReplayMessages(raw)
     userPrompt = parsed.initialUserText
     replayTurns = parsed.replayTurns
+    replayTrailingUserTexts = parsed.trailingUserTexts
   } else {
     // The user message is fully rendered by gym (workspace_path baked in based
     // on dataset_name); we just read it as-is and pass it to opencode.
@@ -455,6 +462,7 @@ async function main() {
     topP: forcedTopP,
     maxTokens: forcedMaxTokens,
     replayTurns,
+    replayTrailingUserTexts,
   })
 
   const startedAt = Date.now()

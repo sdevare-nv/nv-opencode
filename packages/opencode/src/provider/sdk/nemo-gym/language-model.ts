@@ -18,10 +18,12 @@
  * openhands' `llm_completions/<id>/*.json` exactly so gym's
  * `get_openhands_trajectory_from_completions` reads it without changes.
  *
- * Replay: when `cfg.replayTurns` is set, the first N calls (main session
- * only) are answered from that scripted queue instead of a real HTTP call —
- * same synthesized-stream shape as a real response, so opencode's *real*
- * tool-execution path (streamText -> the AI-SDK `tool.execute` closures
+ * Replay: when `cfg.replayTurns` is set, the first N tool-bearing calls on
+ * the top-level agentic-loop session (see `_popReplayTurn`'s docblock for
+ * exactly how that's identified — it's not as simple as "sessionID is the
+ * main session") are answered from that scripted queue instead of a real
+ * HTTP call — same synthesized-stream shape as a real response, so
+ * opencode's *real* tool-execution path (streamText -> the AI-SDK `tool.execute` closures
  * built in session/prompt.ts's resolveTools()) runs each replayed tool call
  * for real against the live sandbox. This is required for correctness:
  * SWE-bench agents mutate a git workspace and the final patch comes from
@@ -33,6 +35,16 @@
  * FIRST dumped completion's cumulative `messages` length, which must be the
  * first live call (by then the replay prefix is already in session
  * history), not a scripted one.
+ *
+ * Subsequent user messages (anything after the trajectory's first user
+ * message) are real request content, not an action to replay — there's
+ * nothing to "re-execute" for a plain user turn. Everything the caller sent
+ * has to be part of what the model sees, starting with the first live call
+ * and on every call after that. Since opencode's own session storage isn't
+ * writable from here (see bench/replay.ts's module docblock), these aren't
+ * persisted anywhere — `_buildRequestParams` re-splices them into the
+ * outgoing message list, at a fixed position relative to the replayed
+ * assistant turns, on every live doStream/doGenerate call.
  */
 
 import {
@@ -111,6 +123,14 @@ const TOKEN_ID_FIELDS = ["prompt_token_ids", "generation_token_ids", "generation
 export interface NemoGymReplayTurn {
   content: string | null
   toolCalls?: Array<{ id: string; name: string; arguments: string }>
+  /**
+   * Subsequent user messages that occurred, in the original trajectory,
+   * immediately before this turn was originally generated. Not replayed as
+   * part of the scripted turn itself (a user message isn't an action) —
+   * spliced into every live request's message list once replay reaches this
+   * point. See the module docblock.
+   */
+  precedingUserTexts?: string[]
 }
 
 export interface NemoGymLanguageModelConfig {
@@ -165,6 +185,13 @@ export interface NemoGymLanguageModelConfig {
    * tool calls must run for real rather than just replaying recorded text.
    */
   replayTurns?: NemoGymReplayTurn[]
+  /**
+   * Subsequent user messages after the last replayed assistant turn, with
+   * nothing recorded after them in the trajectory (trajectory ends on a
+   * user message). Spliced into every live request's message list, same as
+   * NemoGymReplayTurn.precedingUserTexts. See the module docblock.
+   */
+  replayTrailingUserTexts?: string[]
 }
 
 // ---------------------------------------------------------------------------
@@ -185,6 +212,16 @@ export class NemoGymLanguageModel implements LanguageModelV3 {
   // Replay only ever applies to the main session (subagent sessions never
   // existed in the recorded trajectory) — a single counter is sufficient.
   private replayIndex = 0
+  // Precomputed once from cfg.replayTurns[i].precedingUserTexts /
+  // cfg.replayTrailingUserTexts. `beforeAssistantOrdinal` is the 0-based
+  // count of assistant-role messages that must already be in the wire
+  // message list before this text is inserted — i.e. insert right before
+  // the (beforeAssistantOrdinal + 1)-th assistant message overall, or at
+  // the end if that many don't exist yet. All replayed assistant turns are
+  // always fully present in session history by the time any live call
+  // happens, so this ordinal reliably resolves to the same chronological
+  // spot on every call — see _injectPendingUserMessages.
+  private readonly pendingUserInjections: Array<{ beforeAssistantOrdinal: number; text: string }> = []
 
   constructor(modelId: string, cfg: NemoGymLanguageModelConfig) {
     this.modelId = modelId
@@ -193,6 +230,14 @@ export class NemoGymLanguageModel implements LanguageModelV3 {
       ...cfg,
       requestTimeoutMs: cfg.requestTimeoutMs ?? 600_000,
       retries: cfg.retries ?? 3,
+    }
+    cfg.replayTurns?.forEach((turn, i) => {
+      for (const text of turn.precedingUserTexts ?? []) {
+        this.pendingUserInjections.push({ beforeAssistantOrdinal: i, text })
+      }
+    })
+    for (const text of cfg.replayTrailingUserTexts ?? []) {
+      this.pendingUserInjections.push({ beforeAssistantOrdinal: cfg.replayTurns?.length ?? 0, text })
     }
   }
 
@@ -215,13 +260,39 @@ export class NemoGymLanguageModel implements LanguageModelV3 {
     return { sessionID: sid || "main", parentSessionID: pid }
   }
 
-  // Pops the next scripted turn for the main session, or undefined once the
-  // replay queue is exhausted / not applicable (subagent sessions, no
-  // replayTurns configured). Advances state, so call at most once per doStream
-  // / doGenerate invocation.
-  private _popReplayTurn(session: { sessionID: string }): NemoGymReplayTurn | undefined {
+  // Pops the next scripted turn for the main agentic-loop session, or
+  // undefined once the replay queue is exhausted / not applicable. Advances
+  // state, so call at most once per doStream / doGenerate invocation.
+  //
+  // Two exclusions matter here, both confirmed against a real opencode run
+  // (not just unit tests against a bare LanguageModelV3CallOptions):
+  //
+  // 1. Subagent sessions: excluded via `parentSessionID` being set, NOT via
+  //    comparing `sessionID` to a sentinel string. `session/llm.ts` sets
+  //    `x-session-affinity: input.sessionID` UNCONDITIONALLY for every call
+  //    on the nemo-gym provider — including the top-level/main session's own
+  //    calls — so sessionID is *always* the real session id (e.g. "ses_..."),
+  //    never a fallback "main" placeholder. A `sessionID !== "main"` check
+  //    (the original implementation here) is therefore always true and
+  //    replay never fires at all in a real run — a subagent session is the
+  //    one with `parentSessionID` set, not the one whose id happens to equal
+  //    a literal string.
+  // 2. Auxiliary no-tool calls on the SAME session: opencode's own `runLoop`
+  //    forks off title-generation and summary-generation model calls on step
+  //    1 (`session/prompt.ts`), using the same session id as the real
+  //    agentic loop. Those race against the loop's own first call and, if
+  //    unfiltered, silently consume scripted turns meant for the real agent
+  //    (confirmed: they reach this provider before the real loop's first
+  //    call in practice). They're reliably distinguishable because they
+  //    never pass `tools` — only the real agentic loop resolves and sends
+  //    the tool registry — so `hasTools` gates them out.
+  private _popReplayTurn(
+    session: { sessionID: string; parentSessionID: string | undefined },
+    hasTools: boolean,
+  ): NemoGymReplayTurn | undefined {
     if (!this.cfg.replayTurns) return undefined
-    if (session.sessionID !== "main") return undefined
+    if (session.parentSessionID) return undefined
+    if (!hasTools) return undefined
     if (this.replayIndex >= this.cfg.replayTurns.length) return undefined
     return this.cfg.replayTurns[this.replayIndex++]
   }
@@ -295,6 +366,39 @@ export class NemoGymLanguageModel implements LanguageModelV3 {
     }
   }
 
+  // Re-splices subsequent-user-message text from the replay trajectory into
+  // the outgoing message list, in place. Processed in descending ordinal
+  // order so inserting a later text doesn't shift the index about to be
+  // looked up for an earlier one.
+  private _injectPendingUserMessages(messages: ChatRequestMessage[]): void {
+    if (!this.pendingUserInjections.length) return
+    const byOrdinal = new Map<number, string[]>()
+    for (const { beforeAssistantOrdinal, text } of this.pendingUserInjections) {
+      const list = byOrdinal.get(beforeAssistantOrdinal) ?? []
+      list.push(text)
+      byOrdinal.set(beforeAssistantOrdinal, list)
+    }
+    const ordinals = [...byOrdinal.keys()].sort((a, b) => b - a)
+    for (const ordinal of ordinals) {
+      const idx = this._findAssistantOrdinalIndex(messages, ordinal)
+      const texts = byOrdinal.get(ordinal)!
+      messages.splice(idx, 0, ...texts.map((text) => ({ role: "user" as const, content: text })))
+    }
+  }
+
+  // Index right before the `ordinal`-th (0-based) assistant-role message, or
+  // messages.length if fewer than `ordinal` assistant messages exist yet.
+  private _findAssistantOrdinalIndex(messages: ChatRequestMessage[], ordinal: number): number {
+    let seen = 0
+    for (let i = 0; i < messages.length; i++) {
+      if (messages[i].role === "assistant") {
+        if (seen === ordinal) return i
+        seen++
+      }
+    }
+    return messages.length
+  }
+
   get supportedUrls() {
     return {} as Record<string, RegExp[]>
   }
@@ -303,7 +407,7 @@ export class NemoGymLanguageModel implements LanguageModelV3 {
   // implement doGenerate for completeness / future direct-use.
   async doGenerate(options: LanguageModelV3CallOptions) {
     const session = this._sessionFromHeaders(options.headers)
-    const replayTurn = this._popReplayTurn(session)
+    const replayTurn = this._popReplayTurn(session, Boolean(options.tools && options.tools.length > 0))
 
     if (replayTurn) {
       const msg = this._messageFromReplayTurn(replayTurn)
@@ -377,7 +481,7 @@ export class NemoGymLanguageModel implements LanguageModelV3 {
 
   async doStream(options: LanguageModelV3CallOptions) {
     const session = this._sessionFromHeaders(options.headers)
-    const replayTurn = this._popReplayTurn(session)
+    const replayTurn = this._popReplayTurn(session, Boolean(options.tools && options.tools.length > 0))
 
     if (replayTurn) {
       const msg = this._messageFromReplayTurn(replayTurn)
@@ -505,6 +609,16 @@ export class NemoGymLanguageModel implements LanguageModelV3 {
           .join("\n")
       }
     }
+
+    // Trajectory resume: splice in any subsequent user messages from the
+    // replay trajectory (see bench/replay.ts + the module docblock for why
+    // these can't just be persisted into opencode's own session storage).
+    // Done here, before loggedMessages is cloned from messages below, so the
+    // wire request and the trajectory dump gym reads both include them
+    // identically. Re-applied on every call — nothing else carries them
+    // forward — at a position fixed relative to the replayed assistant
+    // turns, so they land in the same chronological spot every time.
+    this._injectPendingUserMessages(messages as ChatRequestMessage[])
 
     // Token-ID handling, mirroring OpenHands' nemo_gym_client.py exactly:
     //   - WIRE request: token IDs on the MOST RECENT assistant message only
