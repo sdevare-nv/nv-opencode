@@ -116,6 +116,9 @@ fi
 if [ "${ENABLE_COMPACTION:-0}" = "1" ] || [ "${ENABLE_COMPACTION:-}" = "true" ]; then
     cmd+=(--enable-compaction)
 fi
+if [ -n "${OPENCODE_CONTEXT_LIMIT:-}" ]; then
+    cmd+=(--context-limit "$OPENCODE_CONTEXT_LIMIT")
+fi
 
 echo "Executing: ${cmd[*]}"
 exec "${cmd[@]}"

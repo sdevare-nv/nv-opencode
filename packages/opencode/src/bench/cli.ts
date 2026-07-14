@@ -47,6 +47,14 @@ interface CliArgs {
   enableSubagents: boolean
   /** Enable opencode's auto-compaction (context summarization). See segment_index in language-model.ts. */
   enableCompaction: boolean
+  /**
+   * Testing knob: override the model's registered context window (default
+   * 131072) so compaction triggers after a handful of turns instead of
+   * ~99K tokens of real usage. Output limit scales down proportionally
+   * (context/4) to keep `usable = context - maxOutputTokens` positive —
+   * see session/overflow.ts.
+   */
+  contextLimit?: number
 }
 
 function parseArgs(argv: string[]): CliArgs {
@@ -100,6 +108,9 @@ function parseArgs(argv: string[]): CliArgs {
         break
       case "--enable-compaction":
         out.enableCompaction = true
+        break
+      case "--context-limit":
+        out.contextLimit = parseInt(next(), 10)
         break
       default:
         if (a.startsWith("--")) throw new Error(`Unknown flag: ${a}`)
@@ -156,6 +167,8 @@ async function buildConfigDir(args: {
   systemPromptPath?: string
   enableSubagents: boolean
   enableCompaction: boolean
+  /** Testing knob — see CliArgs.contextLimit. */
+  contextLimit?: number
   /** Forced sampling params (RL on-policy requirement); from gym llm.model config. */
   temperature?: number
   topP?: number
@@ -194,7 +207,13 @@ async function buildConfigDir(args: {
           [args.modelName]: {
             id: args.modelName,
             name: args.modelName,
-            limit: { context: 131072, output: 32768 },
+            // contextLimit (testing only) scales output down proportionally
+            // (context/4) — leaving output untouched while shrinking context
+            // would make usable() = context - maxOutputTokens go negative,
+            // making every single turn look like overflow (session/overflow.ts).
+            limit: args.contextLimit
+              ? { context: args.contextLimit, output: Math.max(1000, Math.floor(args.contextLimit / 4)) }
+              : { context: 131072, output: 32768 },
             tool_call: true,
             temperature: true,
           },
@@ -438,6 +457,7 @@ async function main() {
     systemPromptPath: args.systemPromptPath,
     enableSubagents: args.enableSubagents,
     enableCompaction: args.enableCompaction,
+    contextLimit: args.contextLimit,
     temperature: forcedTemperature,
     topP: forcedTopP,
     maxTokens: forcedMaxTokens,
