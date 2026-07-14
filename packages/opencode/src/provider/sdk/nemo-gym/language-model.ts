@@ -203,10 +203,11 @@ export class NemoGymLanguageModel implements LanguageModelV3 {
 
   private _sessionFromHeaders(
     headers: unknown,
-  ): { sessionID: string; parentSessionID: string | undefined; isCompactionTurn: boolean } {
+  ): { sessionID: string; parentSessionID: string | undefined; isCompactionTurn: boolean; isTitleTurn: boolean } {
     let sid = ""
     let pid: string | undefined
     let isCompactionTurn = false
+    let isTitleTurn = false
     if (headers && typeof headers === "object") {
       const h = headers as Record<string, unknown>
       const v = h["x-session-affinity"] ?? h["X-Session-Affinity"]
@@ -215,8 +216,9 @@ export class NemoGymLanguageModel implements LanguageModelV3 {
       if (typeof p === "string") pid = p
       const k = h["x-turn-kind"] ?? h["X-Turn-Kind"]
       isCompactionTurn = k === "compaction"
+      isTitleTurn = k === "title"
     }
-    return { sessionID: sid || "main", parentSessionID: pid, isCompactionTurn }
+    return { sessionID: sid || "main", parentSessionID: pid, isCompactionTurn, isTitleTurn }
   }
 
   get supportedUrls() {
@@ -646,8 +648,14 @@ export class NemoGymLanguageModel implements LanguageModelV3 {
     response: ChatResponse
     providerSpecificFields: Record<string, unknown>
     requestParams: Record<string, unknown>
-    session: { sessionID: string; parentSessionID: string | undefined; isCompactionTurn: boolean }
+    session: { sessionID: string; parentSessionID: string | undefined; isCompactionTurn: boolean; isTitleTurn: boolean }
   }) {
+    // Title generation is a one-off, unrelated sub-conversation under the
+    // same sessionID (different system prompt, no tools) that happens BEFORE
+    // the real conversation's own seed — it shares no token-level continuity
+    // with the task trajectory at all. Exclude it entirely rather than let it
+    // consume turn 0 / pollute segment 0's prefix (see session/llm.ts).
+    if (args.session.isTitleTurn) return
     const turn = this._nextTurn(args.session.sessionID)
     const { segment, boundaryReason } = this._nextSegment(args.session.sessionID, args.session.isCompactionTurn)
     if (this.cfg.onCompletion) {

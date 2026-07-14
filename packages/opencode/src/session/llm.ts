@@ -386,6 +386,15 @@ const live: Layer.Layer<
                 // so it can bump the session's on-policy segment counter —
                 // deterministic, not inferred from prompt content.
                 ...(input.agent.name === "compaction" ? { "x-turn-kind": "compaction" } : {}),
+                // opencode auto-generates a session title from the first user
+                // message (agent "title", session/prompt.ts:192) via a
+                // one-off call under the SAME sessionID, before the real
+                // conversation's own system+user seed — a completely
+                // unrelated, non-contiguous sub-conversation (different
+                // system prompt, no tools), not part of the task trajectory.
+                // Tag it so the provider can exclude it from capture entirely
+                // rather than let it corrupt turn/segment numbering.
+                ...(input.agent.name === "title" ? { "x-turn-kind": "title" } : {}),
                 "User-Agent": `opencode/${InstallationVersion}`,
               }),
           ...input.model.headers,

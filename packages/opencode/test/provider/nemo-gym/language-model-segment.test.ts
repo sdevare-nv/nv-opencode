@@ -138,4 +138,20 @@ describe("NemoGymLanguageModel segment tracking", () => {
     expect(bySession["main"]).toBe(1)
     expect(bySession["sub-1"]).toBe(0)
   })
+
+  test("title-generation turns are excluded entirely and don't consume a turn/segment slot", async () => {
+    const model = makeModel()
+    const sid = "ses-title"
+    // opencode fires the title call under the same sessionID before the real
+    // conversation's own seed (session/prompt.ts:192-212) — no tools, a
+    // completely different system prompt, sharing no token continuity.
+    await drain((await model.doStream(callOptions({ "x-session-affinity": sid, "x-turn-kind": "title" }))).stream)
+    await drain((await model.doStream(callOptions({ "x-session-affinity": sid }))).stream) // real turn 0
+    await drain((await model.doStream(callOptions({ "x-session-affinity": sid }))).stream) // real turn 1
+
+    const dumps = await readDumps()
+    expect(dumps.length).toBe(2)
+    expect(dumps.map((d) => d.turn)).toEqual([0, 1])
+    expect(dumps.every((d) => d.segment_index === 0)).toBe(true)
+  })
 })
