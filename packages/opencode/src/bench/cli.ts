@@ -45,6 +45,8 @@ interface CliArgs {
   systemPromptPath?: string
   /** Enable opencode's `task` tool (spawns subagent sessions). */
   enableSubagents: boolean
+  /** Enable opencode's auto-compaction (context summarization). See segment_index in language-model.ts. */
+  enableCompaction: boolean
 }
 
 function parseArgs(argv: string[]): CliArgs {
@@ -54,6 +56,7 @@ function parseArgs(argv: string[]): CliArgs {
     dataset: "",
     split: "test",
     enableSubagents: false,
+    enableCompaction: false,
   }
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]
@@ -94,6 +97,9 @@ function parseArgs(argv: string[]): CliArgs {
         break
       case "--enable-subagents":
         out.enableSubagents = true
+        break
+      case "--enable-compaction":
+        out.enableCompaction = true
         break
       default:
         if (a.startsWith("--")) throw new Error(`Unknown flag: ${a}`)
@@ -149,6 +155,7 @@ async function buildConfigDir(args: {
   maxTurns: number
   systemPromptPath?: string
   enableSubagents: boolean
+  enableCompaction: boolean
   /** Forced sampling params (RL on-policy requirement); from gym llm.model config. */
   temperature?: number
   topP?: number
@@ -227,7 +234,13 @@ async function buildConfigDir(args: {
         options: {},
       },
     },
-    compaction: { auto: false },
+    // `prune` is a separate mechanism from `auto`-compaction: it silently
+    // blanks old tool outputs in place with no session-level boundary event
+    // (compaction.ts PRUNE_MINIMUM/PRUNE_PROTECT), which would corrupt
+    // on-policy contiguity within a segment undetected. Force it off
+    // unconditionally — segment tracking (language-model.ts _nextSegment)
+    // only accounts for `auto`/overflow compaction boundaries, not prune.
+    compaction: { auto: args.enableCompaction, prune: false },
     share: "manual",
   }
 
@@ -424,6 +437,7 @@ async function main() {
     maxTurns: args.maxTurns,
     systemPromptPath: args.systemPromptPath,
     enableSubagents: args.enableSubagents,
+    enableCompaction: args.enableCompaction,
     temperature: forcedTemperature,
     topP: forcedTopP,
     maxTokens: forcedMaxTokens,

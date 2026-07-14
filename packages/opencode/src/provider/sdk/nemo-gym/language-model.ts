@@ -154,6 +154,15 @@ export class NemoGymLanguageModel implements LanguageModelV3 {
   // subagents spawned via the task tool get their own sessionID, so keeping
   // a Map keeps their dump filenames from clobbering the main session's.
   private readonly turnCounters: Map<string, number> = new Map()
+  // Per-session on-policy segment counter. A compaction summarization call
+  // rebuilds its prompt from stored history (stripped media, truncated tool
+  // output — see compaction.ts:406-411), so it is NOT a token-level
+  // continuation of the turn before it, and the turn after it conditions on
+  // the rewritten/summarized session history — neither is prefix-contiguous
+  // with what came before. Both edges of a compaction call are segment
+  // boundaries; see _nextSegment.
+  private readonly segmentCounters: Map<string, number> = new Map()
+  private readonly pendingSegmentBoundary: Map<string, boolean> = new Map()
 
   constructor(modelId: string, cfg: NemoGymLanguageModelConfig) {
     this.modelId = modelId
@@ -171,17 +180,43 @@ export class NemoGymLanguageModel implements LanguageModelV3 {
     return n
   }
 
-  private _sessionFromHeaders(headers: unknown): { sessionID: string; parentSessionID: string | undefined } {
+  // Isolates the compaction call as its own single-turn segment and starts a
+  // fresh segment for the turn immediately after it. Turns within an ordinary
+  // agentic back-and-forth (no compaction in between) stay in the same
+  // segment, so their prompt_token_ids stay prefix-contiguous — the training
+  // invariant nemo-rl asserts (nemo_rl/environments/nemo_gym.py:266-271).
+  private _nextSegment(sessionID: string, isCompactionTurn: boolean): { segment: number; boundaryReason: string | null } {
+    let segment = this.segmentCounters.get(sessionID) ?? 0
+    let boundaryReason: string | null = null
+    if (isCompactionTurn) {
+      segment += 1
+      boundaryReason = "compaction"
+      this.pendingSegmentBoundary.set(sessionID, true)
+    } else if (this.pendingSegmentBoundary.get(sessionID)) {
+      segment += 1
+      boundaryReason = "post_compaction"
+      this.pendingSegmentBoundary.set(sessionID, false)
+    }
+    this.segmentCounters.set(sessionID, segment)
+    return { segment, boundaryReason }
+  }
+
+  private _sessionFromHeaders(
+    headers: unknown,
+  ): { sessionID: string; parentSessionID: string | undefined; isCompactionTurn: boolean } {
     let sid = ""
     let pid: string | undefined
+    let isCompactionTurn = false
     if (headers && typeof headers === "object") {
       const h = headers as Record<string, unknown>
       const v = h["x-session-affinity"] ?? h["X-Session-Affinity"]
       if (typeof v === "string") sid = v
       const p = h["x-parent-session-id"] ?? h["X-Parent-Session-Id"]
       if (typeof p === "string") pid = p
+      const k = h["x-turn-kind"] ?? h["X-Turn-Kind"]
+      isCompactionTurn = k === "compaction"
     }
-    return { sessionID: sid || "main", parentSessionID: pid }
+    return { sessionID: sid || "main", parentSessionID: pid, isCompactionTurn }
   }
 
   get supportedUrls() {
@@ -611,9 +646,10 @@ export class NemoGymLanguageModel implements LanguageModelV3 {
     response: ChatResponse
     providerSpecificFields: Record<string, unknown>
     requestParams: Record<string, unknown>
-    session: { sessionID: string; parentSessionID: string | undefined }
+    session: { sessionID: string; parentSessionID: string | undefined; isCompactionTurn: boolean }
   }) {
     const turn = this._nextTurn(args.session.sessionID)
+    const { segment, boundaryReason } = this._nextSegment(args.session.sessionID, args.session.isCompactionTurn)
     if (this.cfg.onCompletion) {
       try {
         await this.cfg.onCompletion({ turn, ...args })
@@ -645,6 +681,12 @@ export class NemoGymLanguageModel implements LanguageModelV3 {
         session_id: args.session.sessionID,
         parent_session_id: args.session.parentSessionID ?? null,
         turn,
+        // On-policy segment this turn belongs to, and why a boundary was
+        // inserted before it (null = same segment as the previous turn).
+        // See _nextSegment. Absent/undefined on older dumps (pre-compaction-
+        // support) — readers should treat a missing field as segment 0.
+        segment_index: segment,
+        segment_boundary_reason: boundaryReason,
         timestamp: Date.now() / 1000,
       }
       const tmp = `${fpath}.tmp`

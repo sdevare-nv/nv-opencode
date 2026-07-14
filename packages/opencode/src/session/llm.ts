@@ -381,6 +381,11 @@ const live: Layer.Layer<
             : {
                 "x-session-affinity": input.sessionID,
                 ...(input.parentSessionID ? { "x-parent-session-id": input.parentSessionID } : {}),
+                // Lets the nemo-gym provider mark this turn as a compaction
+                // summarization call (agent "compaction", see agent.ts:191)
+                // so it can bump the session's on-policy segment counter —
+                // deterministic, not inferred from prompt content.
+                ...(input.agent.name === "compaction" ? { "x-turn-kind": "compaction" } : {}),
                 "User-Agent": `opencode/${InstallationVersion}`,
               }),
           ...input.model.headers,
