@@ -236,7 +236,7 @@ export class NemoGymLanguageModel implements LanguageModelV3 {
     if (!choice) throw new Error("nemo-gym: empty choices in response")
     const msg: ChatResponseChoice["message"] = choice.message ?? ({ role: "assistant" } as ChatResponseChoice["message"])
 
-    const providerSpecificFields = this._extractProviderFields(msg)
+    const providerSpecificFields = this._extractProviderFields(msg, session.isCompactionTurn)
     const providerMetadata = this._buildProviderMetadata(providerSpecificFields)
 
     const content: LanguageModelV3Content[] = []
@@ -293,7 +293,7 @@ export class NemoGymLanguageModel implements LanguageModelV3 {
           const msg: ChatResponseChoice["message"] =
             choice.message ?? ({ role: "assistant" } as ChatResponseChoice["message"])
 
-          const providerSpecificFields = self._extractProviderFields(msg)
+          const providerSpecificFields = self._extractProviderFields(msg, session.isCompactionTurn)
           const providerMetadata = self._buildProviderMetadata(providerSpecificFields)
 
           // Emit response-metadata first.
@@ -445,6 +445,19 @@ export class NemoGymLanguageModel implements LanguageModelV3 {
       )
       const n = Math.min(promptAssistants.length, wireAssistants.length)
       let mostRecentAttached = false
+      // Segment boundary rule: when the MOST RECENT token-bearing assistant
+      // is a compaction summary, attach NO token IDs to the wire at all. Its
+      // prompt_token_ids embed the entire PRE-compaction context, so
+      // re-attaching them would make the vllm proxy rebuild the old prefix
+      // and silently undo the compaction (the model never sees the compacted
+      // history; reported usage keeps growing; overflow re-fires -> infinite
+      // compact loop). Sending no IDs lets the proxy retokenize the compacted
+      // message list from scratch — the start of a NEW on-policy segment,
+      // matching the segment_index bump in _nextSegment. (Attaching an OLDER
+      // assistant's IDs instead would be equally wrong: they also describe
+      // the pre-compaction token stream.) Logged trajectories keep per-turn
+      // IDs for every assistant, including the summary — training needs them.
+      let wireAttachBlocked = false
       for (let i = n - 1; i >= 0; i--) {
         const parts = promptAssistants[i].content
         if (!Array.isArray(parts)) continue
@@ -452,9 +465,13 @@ export class NemoGymLanguageModel implements LanguageModelV3 {
           const md = part.providerOptions?.[this.provider]
           if (md && TOKEN_ID_FIELDS.every((f) => f in md)) {
             for (const f of TOKEN_ID_FIELDS) loggedAssistants[i][f] = md[f]
-            if (!mostRecentAttached) {
-              for (const f of TOKEN_ID_FIELDS) wireAssistants[i][f] = md[f]
-              mostRecentAttached = true
+            if (!mostRecentAttached && !wireAttachBlocked) {
+              if (md["is_compaction_turn"]) {
+                wireAttachBlocked = true
+              } else {
+                for (const f of TOKEN_ID_FIELDS) wireAssistants[i][f] = md[f]
+                mostRecentAttached = true
+              }
             }
             break
           }
@@ -593,13 +610,23 @@ export class NemoGymLanguageModel implements LanguageModelV3 {
     return new URL(p.replace(/^\//, ""), base).toString()
   }
 
-  private _extractProviderFields(msg: ChatResponseChoice["message"]): Record<string, unknown> {
+  private _extractProviderFields(
+    msg: ChatResponseChoice["message"],
+    isCompactionTurn: boolean = false,
+  ): Record<string, unknown> {
     const out: Record<string, unknown> = {}
     if (Array.isArray(msg.prompt_token_ids)) {
       for (const f of TOKEN_ID_FIELDS) {
         const v = (msg as Record<string, unknown>)[f]
         if (v !== undefined) out[f] = v
       }
+      // Mark token IDs born on a compaction (summary) turn: their
+      // prompt_token_ids embed the PRE-compaction context, so they must
+      // never be re-attached to the wire after the history is compacted —
+      // the vllm proxy would rebuild the old prefix from them and undo the
+      // compaction (context grows forever -> compaction death spiral). See
+      // the wire attach rule in _buildRequestParams.
+      if (isCompactionTurn) out["is_compaction_turn"] = true
     }
     return out
   }
