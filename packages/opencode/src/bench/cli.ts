@@ -25,6 +25,12 @@ import os from "node:os"
 import { spawn } from "node:child_process"
 import { runDeepReset } from "./deep_reset"
 import { bootstrapRepoIfMissing } from "./bootstrap_repo"
+import {
+  collectCompletionMetrics,
+  parseToolExecutionMetric,
+  updateNemoGymMetrics,
+  type ActionExecutionLatencyMetric,
+} from "./metrics"
 // opencode's built-in anthropic system prompt — Bun bundles .txt as a string.
 // Used as the default when no --system-prompt override is passed.
 import PROMPT_ANTHROPIC from "../session/prompt/anthropic.txt"
@@ -347,7 +353,12 @@ function runOpencode(args: {
   env: NodeJS.ProcessEnv
   opencodeBin: string
   agent: string
-}): Promise<{ exitCode: number; stdout: string; stderr: string }> {
+}): Promise<{
+  exitCode: number
+  stdout: string
+  stderr: string
+  actionExecutionLatencies: ActionExecutionLatencyMetric[]
+}> {
   // Use the same bun binary that's currently running — guaranteed to exist
   // and avoids PATH lookup quirks under Bun's posix_spawn.
   const bunPath = process.execPath
@@ -401,12 +412,16 @@ function runOpencode(args: {
     }
     const MAX_KEEP = 256 * 1024 // keep only a bounded tail for error reporting
     let lineBuf = ""
+    const actionExecutionLatencies = new Map<string, ActionExecutionLatencyMetric>()
     child.stdout?.on("data", (b) => {
       lineBuf += b.toString("utf8")
       let idx: number
       while ((idx = lineBuf.indexOf("\n")) >= 0) {
-        const line = scrub(lineBuf.slice(0, idx))
+        const rawLine = lineBuf.slice(0, idx)
         lineBuf = lineBuf.slice(idx + 1)
+        const actionMetric = parseToolExecutionMetric(rawLine)
+        if (actionMetric) actionExecutionLatencies.set(actionMetric.observation_id, actionMetric)
+        const line = scrub(rawLine)
         // Forward to our stdout so the gym log captures the event stream.
         process.stdout.write(line + "\n")
         stdout = (stdout + line + "\n").slice(-MAX_KEEP)
@@ -417,10 +432,11 @@ function runOpencode(args: {
       stderr = (stderr + chunk).slice(-MAX_KEEP)
       process.stderr.write(chunk)
     })
-    child.on("close", (code) => resolve({ exitCode: code ?? 0, stdout, stderr }))
+    const metrics = () => [...actionExecutionLatencies.values()].sort((a, b) => a.timestamp.localeCompare(b.timestamp))
+    child.on("close", (code) => resolve({ exitCode: code ?? 0, stdout, stderr, actionExecutionLatencies: metrics() }))
     child.on("error", (err) => {
       stderr += String(err)
-      resolve({ exitCode: 999, stdout, stderr })
+      resolve({ exitCode: 999, stdout, stderr, actionExecutionLatencies: metrics() })
     })
   })
 }
@@ -563,6 +579,24 @@ async function main() {
 
   const patch = await captureGitDiff(workspaceRoot)
   const benchRunTime = (Date.now() - startedAt) / 1000
+  const completionMetrics = await collectCompletionMetrics(completionsDir, modelName)
+  const perTurnMetrics = {
+    response_latencies: completionMetrics.responseLatencies,
+    action_execution_latencies: result.actionExecutionLatencies,
+    token_usages: completionMetrics.tokenUsages,
+  }
+  const totalModelCallTime = completionMetrics.responseLatencies.reduce((total, metric) => total + metric.latency, 0)
+  const totalCommandExecTime = result.actionExecutionLatencies.reduce((total, metric) => total + metric.latency, 0)
+
+  // OpenCode has no separate OpenHands-style runtime create/connect/init phases.
+  await updateNemoGymMetrics(process.env.NEMO_GYM_METRICS_FPATH, {
+    create_runtime_time: 0,
+    connect_to_runtime_time: 0,
+    initialize_runtime_time: 0,
+    total_model_call_time: totalModelCallTime,
+    total_command_exec_time: totalCommandExecTime,
+    per_turn_metrics: perTurnMetrics,
+  })
 
   const error: string | null = result.exitCode === 0 ? null : `opencode_exit_${result.exitCode}`
   const outPath = await writeOutputJsonl(args.outputDir, instance.instance_id, {
@@ -572,6 +606,7 @@ async function main() {
     metrics: {
       bench_run_time: benchRunTime,
       opencode_exit_code: result.exitCode,
+      ...perTurnMetrics,
     },
     error,
   })

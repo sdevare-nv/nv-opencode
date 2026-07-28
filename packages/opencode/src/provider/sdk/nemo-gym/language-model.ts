@@ -193,11 +193,14 @@ export class NemoGymLanguageModel implements LanguageModelV3 {
   async doGenerate(options: LanguageModelV3CallOptions) {
     const { warnings, loggedMessages, requestParams } = await this._buildRequestParams(options)
     const session = this._sessionFromHeaders(options.headers)
+    const requestStartedAt = Date.now()
     const { responseJson } = await this._postChat(requestParams)
+    const responseCompletedAt = Date.now()
 
     const choice = responseJson.choices[0]
     if (!choice) throw new Error("nemo-gym: empty choices in response")
-    const msg: ChatResponseChoice["message"] = choice.message ?? ({ role: "assistant" } as ChatResponseChoice["message"])
+    const msg: ChatResponseChoice["message"] =
+      choice.message ?? ({ role: "assistant" } as ChatResponseChoice["message"])
 
     const providerSpecificFields = this._extractProviderFields(msg)
     const providerMetadata = this._buildProviderMetadata(providerSpecificFields)
@@ -223,6 +226,8 @@ export class NemoGymLanguageModel implements LanguageModelV3 {
       providerSpecificFields,
       requestParams,
       session,
+      requestStartedAt,
+      responseCompletedAt,
     })
 
     return {
@@ -249,7 +254,9 @@ export class NemoGymLanguageModel implements LanguageModelV3 {
         controller.enqueue({ type: "stream-start", warnings })
 
         try {
+          const requestStartedAt = Date.now()
           const { responseJson } = await self._postChat(requestParams)
+          const responseCompletedAt = Date.now()
 
           const choice = responseJson.choices[0]
           if (!choice) throw new Error("nemo-gym: empty choices in response")
@@ -317,6 +324,8 @@ export class NemoGymLanguageModel implements LanguageModelV3 {
             providerSpecificFields,
             requestParams,
             session,
+            requestStartedAt,
+            responseCompletedAt,
           })
 
           controller.enqueue({
@@ -575,7 +584,10 @@ export class NemoGymLanguageModel implements LanguageModelV3 {
     return md
   }
 
-  private _mapFinishReason(raw: string | null): { unified: "stop" | "length" | "tool-calls" | "error" | "other"; raw: string | undefined } {
+  private _mapFinishReason(raw: string | null): {
+    unified: "stop" | "length" | "tool-calls" | "error" | "other"
+    raw: string | undefined
+  } {
     if (!raw) return { unified: "other", raw: undefined }
     switch (raw) {
       case "stop":
@@ -612,6 +624,8 @@ export class NemoGymLanguageModel implements LanguageModelV3 {
     providerSpecificFields: Record<string, unknown>
     requestParams: Record<string, unknown>
     session: { sessionID: string; parentSessionID: string | undefined }
+    requestStartedAt: number
+    responseCompletedAt: number
   }) {
     const turn = this._nextTurn(args.session.sessionID)
     if (this.cfg.onCompletion) {
@@ -645,7 +659,8 @@ export class NemoGymLanguageModel implements LanguageModelV3 {
         session_id: args.session.sessionID,
         parent_session_id: args.session.parentSessionID ?? null,
         turn,
-        timestamp: Date.now() / 1000,
+        latency: (args.responseCompletedAt - args.requestStartedAt) / 1000,
+        timestamp: args.responseCompletedAt / 1000,
       }
       const tmp = `${fpath}.tmp`
       await fs.writeFile(tmp, JSON.stringify(payload))
