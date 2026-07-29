@@ -41,18 +41,18 @@ describe("bench metrics", () => {
     expect(parseToolExecutionMetric("not json")).toBeUndefined()
   })
 
-  test("collects and chronologically sorts completion timing and usage", async () => {
+  test("collects and sorts completion timing and usage by request start", async () => {
     await withTempDir(async (directory) => {
-      const later = {
+      const startsFirstButCompletesLater = {
         response: {
           id: "response-2",
           model: "model-b",
           usage: { prompt_tokens: 20, completion_tokens: 4 },
         },
-        latency: 2,
+        latency: 15,
         timestamp: 20,
       }
-      const earlier = {
+      const startsLaterButCompletesFirst = {
         response: {
           id: "response-1",
           usage: {
@@ -64,37 +64,27 @@ describe("bench metrics", () => {
         latency: 1.25,
         timestamp: 10,
       }
-      await fs.writeFile(path.join(directory, "later.json"), JSON.stringify(later))
-      await fs.writeFile(path.join(directory, "earlier.json"), JSON.stringify(earlier))
+      await fs.writeFile(path.join(directory, "later.json"), JSON.stringify(startsFirstButCompletesLater))
+      await fs.writeFile(path.join(directory, "earlier.json"), JSON.stringify(startsLaterButCompletesFirst))
       await fs.writeFile(path.join(directory, "incomplete.json"), JSON.stringify({ response: {} }))
 
       const metrics = await collectCompletionMetrics(directory, "fallback-model")
 
       expect(metrics.responseLatencies).toEqual([
         {
+          model: "model-b",
+          latency: 15,
+          response_id: "response-2",
+          timestamp: "1970-01-01T00:00:20.000Z",
+        },
+        {
           model: "fallback-model",
           latency: 1.25,
           response_id: "response-1",
           timestamp: "1970-01-01T00:00:10.000Z",
         },
-        {
-          model: "model-b",
-          latency: 2,
-          response_id: "response-2",
-          timestamp: "1970-01-01T00:00:20.000Z",
-        },
       ])
       expect(metrics.tokenUsages).toEqual([
-        {
-          model: "fallback-model",
-          prompt_tokens: 10,
-          completion_tokens: 3,
-          cache_read_tokens: 2,
-          cache_write_tokens: 0,
-          context_window: 0,
-          per_turn_token: 13,
-          response_id: "response-1",
-        },
         {
           model: "model-b",
           prompt_tokens: 20,
@@ -104,6 +94,16 @@ describe("bench metrics", () => {
           context_window: 0,
           per_turn_token: 24,
           response_id: "response-2",
+        },
+        {
+          model: "fallback-model",
+          prompt_tokens: 10,
+          completion_tokens: 3,
+          cache_read_tokens: 2,
+          cache_write_tokens: 0,
+          context_window: 0,
+          per_turn_token: 13,
+          response_id: "response-1",
         },
       ])
     })

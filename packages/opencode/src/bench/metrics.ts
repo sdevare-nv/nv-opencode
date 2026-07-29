@@ -99,6 +99,7 @@ export async function collectCompletionMetrics(
   fallbackModel: string,
 ): Promise<CompletionMetrics> {
   const records: Array<{
+    startedAtSeconds: number
     timestampSeconds: number
     responseLatency: ResponseLatencyMetric
     tokenUsage: TokenUsageMetric
@@ -125,6 +126,7 @@ export async function collectCompletionMetrics(
     const cacheReadTokens = nonNegativeInteger(dump.response?.usage?.prompt_tokens_details?.cached_tokens)
 
     records.push({
+      startedAtSeconds: timestampSeconds - latency,
       timestampSeconds,
       responseLatency: {
         model,
@@ -145,7 +147,13 @@ export async function collectCompletionMetrics(
     })
   }
 
-  records.sort((a, b) => a.timestampSeconds - b.timestampSeconds)
+  // Subagent requests can overlap, so completion order is not turn-start order.
+  records.sort(
+    (a, b) =>
+      a.startedAtSeconds - b.startedAtSeconds ||
+      a.timestampSeconds - b.timestampSeconds ||
+      a.responseLatency.response_id.localeCompare(b.responseLatency.response_id),
+  )
   return {
     responseLatencies: records.map((record) => record.responseLatency),
     tokenUsages: records.map((record) => record.tokenUsage),
