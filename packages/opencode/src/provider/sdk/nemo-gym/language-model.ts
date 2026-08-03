@@ -75,6 +75,9 @@ interface ChatResponseUsage {
   prompt_tokens?: number | null
   completion_tokens?: number | null
   total_tokens?: number | null
+  completion_tokens_details?: {
+    reasoning_tokens?: number | null
+  } | null
 }
 
 interface ChatResponse {
@@ -155,6 +158,17 @@ export class NemoGymLanguageModel implements LanguageModelV3 {
   // a Map keeps their dump filenames from clobbering the main session's.
   private readonly turnCounters: Map<string, number> = new Map()
 
+  private _requestKind(
+    messages: ChatRequestMessage[],
+    parentSessionID: string | undefined,
+  ): "agent" | "title" | "subagent" {
+    if (parentSessionID) return "subagent"
+    const titlePrompt = "Generate a title for this conversation:"
+    return messages.some((message) => message.role === "user" && JSON.stringify(message.content).includes(titlePrompt))
+      ? "title"
+      : "agent"
+  }
+
   constructor(modelId: string, cfg: NemoGymLanguageModelConfig) {
     this.modelId = modelId
     this.provider = cfg.provider
@@ -193,6 +207,7 @@ export class NemoGymLanguageModel implements LanguageModelV3 {
   async doGenerate(options: LanguageModelV3CallOptions) {
     const { warnings, loggedMessages, requestParams } = await this._buildRequestParams(options)
     const session = this._sessionFromHeaders(options.headers)
+    const turn = this._nextTurn(session.sessionID)
     const requestStartedAt = Date.now()
     const { responseJson } = await this._postChat(requestParams)
     const responseCompletedAt = Date.now()
@@ -226,6 +241,7 @@ export class NemoGymLanguageModel implements LanguageModelV3 {
       providerSpecificFields,
       requestParams,
       session,
+      turn,
       requestStartedAt,
       responseCompletedAt,
     })
@@ -254,6 +270,7 @@ export class NemoGymLanguageModel implements LanguageModelV3 {
         controller.enqueue({ type: "stream-start", warnings })
 
         try {
+          const turn = self._nextTurn(session.sessionID)
           const requestStartedAt = Date.now()
           const { responseJson } = await self._postChat(requestParams)
           const responseCompletedAt = Date.now()
@@ -324,6 +341,7 @@ export class NemoGymLanguageModel implements LanguageModelV3 {
             providerSpecificFields,
             requestParams,
             session,
+            turn,
             requestStartedAt,
             responseCompletedAt,
           })
@@ -624,13 +642,19 @@ export class NemoGymLanguageModel implements LanguageModelV3 {
     providerSpecificFields: Record<string, unknown>
     requestParams: Record<string, unknown>
     session: { sessionID: string; parentSessionID: string | undefined }
+    turn: number
     requestStartedAt: number
     responseCompletedAt: number
   }) {
-    const turn = this._nextTurn(args.session.sessionID)
     if (this.cfg.onCompletion) {
       try {
-        await this.cfg.onCompletion({ turn, ...args })
+        await this.cfg.onCompletion({
+          turn: args.turn,
+          messages: args.messages,
+          response: args.response,
+          providerSpecificFields: args.providerSpecificFields,
+          requestParams: args.requestParams,
+        })
       } catch (err) {
         console.warn(`[nemo-gym] onCompletion hook threw: ${String(err)}`)
       }
@@ -640,7 +664,7 @@ export class NemoGymLanguageModel implements LanguageModelV3 {
 
     try {
       await fs.mkdir(this.cfg.completionsDir, { recursive: true })
-      const turnStr = String(turn).padStart(4, "0")
+      const turnStr = String(args.turn).padStart(4, "0")
       const safeModel = this.modelId.replace(/\//g, "__")
       // sessionID is part of the filename so subagent dumps don't clobber the
       // main session's. Sanitized for filesystem safety.
@@ -658,7 +682,9 @@ export class NemoGymLanguageModel implements LanguageModelV3 {
         kwargs,
         session_id: args.session.sessionID,
         parent_session_id: args.session.parentSessionID ?? null,
-        turn,
+        turn: args.turn,
+        request_kind: this._requestKind(args.messages, args.session.parentSessionID),
+        request_started_at: args.requestStartedAt / 1000,
         latency: (args.responseCompletedAt - args.requestStartedAt) / 1000,
         timestamp: args.responseCompletedAt / 1000,
       }

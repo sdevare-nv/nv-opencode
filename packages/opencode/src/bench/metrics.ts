@@ -4,14 +4,22 @@ export interface ResponseLatencyMetric {
   model: string
   latency: number
   response_id: string
+  request_kind: "agent" | "title" | "subagent"
+  session_id: string
+  parent_session_id: string | null
+  session_turn: number
+  start_timestamp: string
   timestamp: string
 }
 
 export interface ActionExecutionLatencyMetric {
   observation_type: string
   observation_id: string
+  session_id: string
+  child_session_id?: string
   latency: number
   message: string
+  start_timestamp: string
   timestamp: string
 }
 
@@ -19,6 +27,7 @@ export interface TokenUsageMetric {
   model: string
   prompt_tokens: number
   completion_tokens: number
+  reasoning_tokens?: number
   cache_read_tokens: number
   cache_write_tokens: number
   context_window: number
@@ -38,12 +47,20 @@ interface CompletionDump {
     usage?: {
       prompt_tokens?: unknown
       completion_tokens?: unknown
+      completion_tokens_details?: {
+        reasoning_tokens?: unknown
+      } | null
       prompt_tokens_details?: {
         cached_tokens?: unknown
       } | null
     }
   }
   latency?: unknown
+  request_kind?: unknown
+  request_started_at?: unknown
+  session_id?: unknown
+  parent_session_id?: unknown
+  turn?: unknown
   timestamp?: unknown
 }
 
@@ -54,6 +71,11 @@ function finiteNumber(value: unknown): number | undefined {
 function nonNegativeInteger(value: unknown): number {
   const number = finiteNumber(value)
   return number === undefined ? 0 : Math.max(0, Math.trunc(number))
+}
+
+function optionalNonNegativeInteger(value: unknown): number | undefined {
+  const number = finiteNumber(value)
+  return number === undefined || number < 0 ? undefined : Math.trunc(number)
 }
 
 function isoTimestamp(seconds: number): string {
@@ -78,18 +100,27 @@ export function parseToolExecutionMetric(line: string): ActionExecutionLatencyMe
     return undefined
   }
 
-  const start = finiteNumber(state.time?.start)
+  const recordedStart = finiteNumber(event.toolStart)
   const end = finiteNumber(state.time?.end)
   const callID = typeof part.callID === "string" ? part.callID : typeof part.id === "string" ? part.id : undefined
-  if (start === undefined || end === undefined || end < start || !callID) return undefined
+  if (recordedStart === undefined || end === undefined || end < recordedStart || !callID) return undefined
 
   const title = typeof state.title === "string" ? state.title : ""
   const error = typeof state.error === "string" ? state.error : ""
+  const metadata =
+    "metadata" in state && state.metadata && typeof state.metadata === "object"
+      ? (state.metadata as Record<string, unknown>)
+      : undefined
+  const childSessionID =
+    part.tool === "task" && typeof metadata?.sessionId === "string" ? metadata.sessionId : undefined
   return {
     observation_type: typeof part.tool === "string" ? part.tool : "opencode_tool",
     observation_id: callID,
-    latency: (end - start) / 1000,
+    session_id: typeof event.sessionID === "string" ? event.sessionID : "",
+    ...(childSessionID ? { child_session_id: childSessionID } : {}),
+    latency: (end - recordedStart) / 1000,
     message: title || error,
+    start_timestamp: new Date(recordedStart).toISOString(),
     timestamp: new Date(end).toISOString(),
   }
 }
@@ -116,28 +147,50 @@ export async function collectCompletionMetrics(
     }
 
     const latency = finiteNumber(dump.latency)
+    const requestStartedAtSeconds = finiteNumber(dump.request_started_at)
     const timestampSeconds = finiteNumber(dump.timestamp)
     const responseID = typeof dump.response?.id === "string" ? dump.response.id : ""
-    if (latency === undefined || latency < 0 || timestampSeconds === undefined || !responseID) continue
+    if (
+      latency === undefined ||
+      latency < 0 ||
+      requestStartedAtSeconds === undefined ||
+      timestampSeconds === undefined ||
+      timestampSeconds < requestStartedAtSeconds ||
+      !responseID
+    )
+      continue
 
     const model = typeof dump.response?.model === "string" ? dump.response.model : fallbackModel
+    const requestKind = dump.request_kind === "title" || dump.request_kind === "subagent" ? dump.request_kind : "agent"
+    const sessionID = typeof dump.session_id === "string" ? dump.session_id : ""
+    const parentSessionID = typeof dump.parent_session_id === "string" ? dump.parent_session_id : null
+    const sessionTurn = nonNegativeInteger(dump.turn)
     const promptTokens = nonNegativeInteger(dump.response?.usage?.prompt_tokens)
     const completionTokens = nonNegativeInteger(dump.response?.usage?.completion_tokens)
+    const reasoningTokens = optionalNonNegativeInteger(
+      dump.response?.usage?.completion_tokens_details?.reasoning_tokens,
+    )
     const cacheReadTokens = nonNegativeInteger(dump.response?.usage?.prompt_tokens_details?.cached_tokens)
 
     records.push({
-      startedAtSeconds: timestampSeconds - latency,
+      startedAtSeconds: requestStartedAtSeconds,
       timestampSeconds,
       responseLatency: {
         model,
         latency,
         response_id: responseID,
+        request_kind: requestKind,
+        session_id: sessionID,
+        parent_session_id: parentSessionID,
+        session_turn: sessionTurn,
+        start_timestamp: isoTimestamp(requestStartedAtSeconds),
         timestamp: isoTimestamp(timestampSeconds),
       },
       tokenUsage: {
         model,
         prompt_tokens: promptTokens,
         completion_tokens: completionTokens,
+        ...(reasoningTokens === undefined ? {} : { reasoning_tokens: reasoningTokens }),
         cache_read_tokens: cacheReadTokens,
         cache_write_tokens: 0,
         context_window: 0,
