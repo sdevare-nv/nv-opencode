@@ -17,6 +17,8 @@ export interface ActionExecutionLatencyMetric {
   observation_id: string
   session_id: string
   child_session_id?: string
+  input?: Record<string, unknown>
+  output?: string
   latency: number
   message: string
   start_timestamp: string
@@ -113,11 +115,18 @@ export function parseToolExecutionMetric(line: string): ActionExecutionLatencyMe
       : undefined
   const childSessionID =
     part.tool === "task" && typeof metadata?.sessionId === "string" ? metadata.sessionId : undefined
+  const input =
+    state.input && typeof state.input === "object" && !Array.isArray(state.input)
+      ? (state.input as Record<string, unknown>)
+      : undefined
+  const output = typeof state.output === "string" ? state.output : undefined
   return {
     observation_type: typeof part.tool === "string" ? part.tool : "opencode_tool",
     observation_id: callID,
     session_id: typeof event.sessionID === "string" ? event.sessionID : "",
     ...(childSessionID ? { child_session_id: childSessionID } : {}),
+    ...(input ? { input } : {}),
+    ...(output === undefined ? {} : { output }),
     latency: (end - recordedStart) / 1000,
     message: title || error,
     start_timestamp: new Date(recordedStart).toISOString(),
