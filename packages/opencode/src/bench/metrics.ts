@@ -1,7 +1,9 @@
 import { promises as fs } from "node:fs"
 import path from "node:path"
 
-export type TimingBreakdown = Record<string, number | boolean>
+export interface NemoRlTimingBreakdown {
+  nemo_rl_route_total_ms: number
+}
 
 export interface ResponseLatencyMetric {
   model: string
@@ -13,7 +15,7 @@ export interface ResponseLatencyMetric {
   session_turn: number
   start_timestamp: string
   timestamp: string
-  timing_breakdown?: TimingBreakdown
+  timing_breakdown?: NemoRlTimingBreakdown
 }
 
 export interface ActionExecutionLatencyMetric {
@@ -60,6 +62,9 @@ interface CompletionDump {
         cached_tokens?: unknown
       } | null
     }
+    nemo_gym_timing?: {
+      nemo_rl_route_total_ms?: unknown
+    }
   }
   latency?: unknown
   request_kind?: unknown
@@ -68,7 +73,6 @@ interface CompletionDump {
   parent_session_id?: unknown
   turn?: unknown
   timestamp?: unknown
-  timing_breakdown?: unknown
 }
 
 function finiteNumber(value: unknown): number | undefined {
@@ -89,14 +93,9 @@ function isoTimestamp(seconds: number): string {
   return new Date(seconds * 1000).toISOString()
 }
 
-function timingBreakdown(value: unknown): TimingBreakdown | undefined {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined
-
-  const entries = Object.entries(value).filter(
-    (entry): entry is [string, number | boolean] =>
-      typeof entry[1] === "boolean" || (typeof entry[1] === "number" && Number.isFinite(entry[1])),
-  )
-  return entries.length > 0 ? Object.fromEntries(entries) : undefined
+function nemoRlTimingBreakdown(value: unknown): NemoRlTimingBreakdown | undefined {
+  const routeTotalMs = finiteNumber(value)
+  return routeTotalMs === undefined ? undefined : { nemo_rl_route_total_ms: routeTotalMs }
 }
 
 export function parseToolExecutionMetric(line: string): ActionExecutionLatencyMetric | undefined {
@@ -195,7 +194,7 @@ export async function collectCompletionMetrics(
       dump.response?.usage?.completion_tokens_details?.reasoning_tokens,
     )
     const cacheReadTokens = nonNegativeInteger(dump.response?.usage?.prompt_tokens_details?.cached_tokens)
-    const requestTiming = timingBreakdown(dump.timing_breakdown)
+    const requestTiming = nemoRlTimingBreakdown(dump.response?.nemo_gym_timing?.nemo_rl_route_total_ms)
 
     records.push({
       startedAtSeconds: requestStartedAtSeconds,
