@@ -86,6 +86,7 @@ interface ChatResponse {
   created?: number
   choices: ChatResponseChoice[]
   usage?: ChatResponseUsage
+  nemo_gym_timing?: TimingBreakdown
 }
 
 // ---------------------------------------------------------------------------
@@ -93,6 +94,21 @@ interface ChatResponse {
 // ---------------------------------------------------------------------------
 
 const TOKEN_ID_FIELDS = ["prompt_token_ids", "generation_token_ids", "generation_log_probs"] as const
+type TimingBreakdown = Record<string, number | boolean>
+
+function parseServerTiming(value: string | null): Record<string, number> {
+  if (!value) return {}
+
+  const timing: Record<string, number> = {}
+  for (const metric of value.split(",")) {
+    const [rawName, ...parameters] = metric.split(";")
+    const duration = parameters.map((parameter) => parameter.trim().split("=", 2)).find(([key]) => key === "dur")?.[1]
+    const name = rawName?.trim()
+    const parsed = Number(duration)
+    if (name && duration !== undefined && Number.isFinite(parsed)) timing[name] = parsed
+  }
+  return timing
+}
 
 export interface NemoGymLanguageModelConfig {
   /** Provider id used to namespace providerMetadata. Defaults to "nemo-gym". */
@@ -205,12 +221,18 @@ export class NemoGymLanguageModel implements LanguageModelV3 {
   // The streamText path in `session/llm.ts` only calls doStream. We still
   // implement doGenerate for completeness / future direct-use.
   async doGenerate(options: LanguageModelV3CallOptions) {
+    const requestBuildStartedAt = performance.now()
     const { warnings, loggedMessages, requestParams } = await this._buildRequestParams(options)
+    const timingBreakdown: TimingBreakdown = {
+      client_request_build_ms: performance.now() - requestBuildStartedAt,
+    }
     const session = this._sessionFromHeaders(options.headers)
     const turn = this._nextTurn(session.sessionID)
     const requestStartedAt = Date.now()
-    const { responseJson } = await this._postChat(requestParams)
+    const { responseJson, clientTiming } = await this._postChat(requestParams)
     const responseCompletedAt = Date.now()
+    Object.assign(timingBreakdown, clientTiming, responseJson.nemo_gym_timing)
+    const responseProcessingStartedAt = performance.now()
 
     const choice = responseJson.choices[0]
     if (!choice) throw new Error("nemo-gym: empty choices in response")
@@ -234,6 +256,7 @@ export class NemoGymLanguageModel implements LanguageModelV3 {
         })
       }
     }
+    timingBreakdown.client_response_processing_ms = performance.now() - responseProcessingStartedAt
 
     await this._dumpAndNotify({
       messages: loggedMessages,
@@ -244,6 +267,7 @@ export class NemoGymLanguageModel implements LanguageModelV3 {
       turn,
       requestStartedAt,
       responseCompletedAt,
+      timingBreakdown,
     })
 
     return {
@@ -258,7 +282,11 @@ export class NemoGymLanguageModel implements LanguageModelV3 {
   }
 
   async doStream(options: LanguageModelV3CallOptions) {
+    const requestBuildStartedAt = performance.now()
     const { warnings, loggedMessages, requestParams } = await this._buildRequestParams(options)
+    const timingBreakdown: TimingBreakdown = {
+      client_request_build_ms: performance.now() - requestBuildStartedAt,
+    }
     const session = this._sessionFromHeaders(options.headers)
 
     // Fire the HTTP call eagerly so any error surfaces synchronously when the
@@ -272,8 +300,10 @@ export class NemoGymLanguageModel implements LanguageModelV3 {
         try {
           const turn = self._nextTurn(session.sessionID)
           const requestStartedAt = Date.now()
-          const { responseJson } = await self._postChat(requestParams)
+          const { responseJson, clientTiming } = await self._postChat(requestParams)
           const responseCompletedAt = Date.now()
+          Object.assign(timingBreakdown, clientTiming, responseJson.nemo_gym_timing)
+          const responseProcessingStartedAt = performance.now()
 
           const choice = responseJson.choices[0]
           if (!choice) throw new Error("nemo-gym: empty choices in response")
@@ -335,6 +365,7 @@ export class NemoGymLanguageModel implements LanguageModelV3 {
 
           // Persist trajectory BEFORE finishing so a downstream tool crash
           // cannot lose this turn's token IDs.
+          timingBreakdown.client_response_processing_ms = performance.now() - responseProcessingStartedAt
           await self._dumpAndNotify({
             messages: loggedMessages,
             response: responseJson,
@@ -344,6 +375,7 @@ export class NemoGymLanguageModel implements LanguageModelV3 {
             turn,
             requestStartedAt,
             responseCompletedAt,
+            timingBreakdown,
           })
 
           controller.enqueue({
@@ -511,7 +543,10 @@ export class NemoGymLanguageModel implements LanguageModelV3 {
     return { warnings, messages, loggedMessages, tools, toolChoice, requestParams }
   }
 
-  private async _postChat(params: Record<string, unknown>): Promise<{ responseJson: ChatResponse }> {
+  private async _postChat(params: Record<string, unknown>): Promise<{
+    responseJson: ChatResponse
+    clientTiming: TimingBreakdown
+  }> {
     const url = this._urlFor("/v1/chat/completions")
     const headers: Record<string, string> = {
       "Content-Type": "application/json",
@@ -545,12 +580,18 @@ export class NemoGymLanguageModel implements LanguageModelV3 {
       // timeoutMs<=0 means "no timeout" — don't install the abort timer.
       const timer = timeoutMs > 0 ? setTimeout(() => ac.abort(), timeoutMs) : null
       try {
+        const serializeStartedAt = performance.now()
+        const requestBody = JSON.stringify(params)
+        const requestSerializedAt = performance.now()
+        const fetchStartedAt = performance.now()
         const res = await fetch(url, {
           method: "POST",
           headers,
-          body: JSON.stringify(params),
+          body: requestBody,
           signal: ac.signal,
         })
+        const responseHeadersAt = performance.now()
+        const serverTiming = parseServerTiming(res.headers.get("server-timing"))
         if (timer) clearTimeout(timer)
         if (!res.ok) {
           const text = await res.text().catch(() => "")
@@ -564,8 +605,25 @@ export class NemoGymLanguageModel implements LanguageModelV3 {
             if (k && v) this.cookies[k.trim()] = v.trim()
           }
         }
-        const responseJson = (await res.json()) as ChatResponse
-        return { responseJson }
+        const responseBodyStartedAt = performance.now()
+        const responseBody = await res.text()
+        const responseBodyReadAt = performance.now()
+        const responseJson = JSON.parse(responseBody) as ChatResponse
+        const responseParsedAt = performance.now()
+        return {
+          responseJson,
+          clientTiming: {
+            client_request_serialize_ms: requestSerializedAt - serializeStartedAt,
+            client_fetch_to_headers_ms: responseHeadersAt - fetchStartedAt,
+            client_response_body_read_ms: responseBodyReadAt - responseBodyStartedAt,
+            client_response_json_parse_ms: responseParsedAt - responseBodyReadAt,
+            client_http_total_ms: responseParsedAt - fetchStartedAt,
+            client_request_body_chars: requestBody.length,
+            client_response_body_chars: responseBody.length,
+            client_retry_count: attempt,
+            ...serverTiming,
+          },
+        }
       } catch (err) {
         if (timer) clearTimeout(timer)
         lastErr = err
@@ -645,6 +703,7 @@ export class NemoGymLanguageModel implements LanguageModelV3 {
     turn: number
     requestStartedAt: number
     responseCompletedAt: number
+    timingBreakdown: TimingBreakdown
   }) {
     if (this.cfg.onCompletion) {
       try {
@@ -687,6 +746,7 @@ export class NemoGymLanguageModel implements LanguageModelV3 {
         request_started_at: args.requestStartedAt / 1000,
         latency: (args.responseCompletedAt - args.requestStartedAt) / 1000,
         timestamp: args.responseCompletedAt / 1000,
+        timing_breakdown: args.timingBreakdown,
       }
       const tmp = `${fpath}.tmp`
       await fs.writeFile(tmp, JSON.stringify(payload))

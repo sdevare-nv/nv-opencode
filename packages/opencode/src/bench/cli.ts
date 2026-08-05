@@ -420,7 +420,10 @@ function runOpencode(args: {
         const rawLine = lineBuf.slice(0, idx)
         lineBuf = lineBuf.slice(idx + 1)
         const actionMetric = parseToolExecutionMetric(rawLine)
-        if (actionMetric) actionExecutionLatencies.set(actionMetric.observation_id, actionMetric)
+        if (actionMetric) {
+          const metricID = `${actionMetric.session_id}:${actionMetric.observation_id}`
+          actionExecutionLatencies.set(metricID, actionMetric)
+        }
         const line = scrub(rawLine)
         // Forward to our stdout so the gym log captures the event stream.
         process.stdout.write(line + "\n")
