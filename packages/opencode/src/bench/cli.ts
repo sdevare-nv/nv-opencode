@@ -307,7 +307,6 @@ function runOpencode(args: {
         `nemo-gym/${args.modelName}`,
         "--format",
         "json",
-        "--dangerously-skip-permissions",
         "--dir",
         args.workspaceRoot,
       ],
@@ -470,6 +469,9 @@ async function main() {
     OPENCODE_DB: ":memory:",
     OPENCODE_DATA: path.join(tmpRoot, "data"),
     OPENCODE_CONFIG: configFile,
+    // The benchmark already runs inside a SIF sandbox, so make that the
+    // security boundary. This final config override applies to subagents too.
+    OPENCODE_PERMISSION: JSON.stringify({ "*": "allow" }),
     // Disable opencode's built-in plugin loaders; the bench harness doesn't need them.
     OPENCODE_PURE: "1",
     // Skip the dynamic env block (working dir + Today's date) in the system
