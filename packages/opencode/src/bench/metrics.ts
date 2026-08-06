@@ -1,10 +1,6 @@
 import { promises as fs } from "node:fs"
 import path from "node:path"
 
-export interface NemoRlTimingBreakdown {
-  nemo_rl_route_total_ms: number
-}
-
 export interface ResponseLatencyMetric {
   model: string
   latency: number
@@ -15,7 +11,6 @@ export interface ResponseLatencyMetric {
   session_turn: number
   start_timestamp: string
   timestamp: string
-  timing_breakdown?: NemoRlTimingBreakdown
 }
 
 export interface ActionExecutionLatencyMetric {
@@ -62,9 +57,6 @@ interface CompletionDump {
         cached_tokens?: unknown
       } | null
     }
-    nemo_gym_timing?: {
-      nemo_rl_route_total_ms?: unknown
-    }
   }
   latency?: unknown
   request_kind?: unknown
@@ -91,11 +83,6 @@ function optionalNonNegativeInteger(value: unknown): number | undefined {
 
 function isoTimestamp(seconds: number): string {
   return new Date(seconds * 1000).toISOString()
-}
-
-function nemoRlTimingBreakdown(value: unknown): NemoRlTimingBreakdown | undefined {
-  const routeTotalMs = finiteNumber(value)
-  return routeTotalMs === undefined ? undefined : { nemo_rl_route_total_ms: routeTotalMs }
 }
 
 export function parseToolExecutionMetric(line: string): ActionExecutionLatencyMetric | undefined {
@@ -194,8 +181,6 @@ export async function collectCompletionMetrics(
       dump.response?.usage?.completion_tokens_details?.reasoning_tokens,
     )
     const cacheReadTokens = nonNegativeInteger(dump.response?.usage?.prompt_tokens_details?.cached_tokens)
-    const requestTiming = nemoRlTimingBreakdown(dump.response?.nemo_gym_timing?.nemo_rl_route_total_ms)
-
     records.push({
       startedAtSeconds: requestStartedAtSeconds,
       timestampSeconds,
@@ -209,7 +194,6 @@ export async function collectCompletionMetrics(
         session_turn: sessionTurn,
         start_timestamp: isoTimestamp(requestStartedAtSeconds),
         timestamp: isoTimestamp(timestampSeconds),
-        ...(requestTiming ? { timing_breakdown: requestTiming } : {}),
       },
       tokenUsage: {
         model,

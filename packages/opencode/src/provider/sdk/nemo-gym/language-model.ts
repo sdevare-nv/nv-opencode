@@ -86,9 +86,6 @@ interface ChatResponse {
   created?: number
   choices: ChatResponseChoice[]
   usage?: ChatResponseUsage
-  nemo_gym_timing?: {
-    nemo_rl_route_total_ms?: number
-  }
 }
 
 // ---------------------------------------------------------------------------
