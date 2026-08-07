@@ -440,7 +440,6 @@ export const RunCommand = effectCmd({
 
         const events = await sdk.event.subscribe()
         let error: string | undefined
-        const toolStartTimes = new Map<string, number>()
 
         async function loop() {
           const toggles = new Map<string, boolean>()
@@ -461,18 +460,8 @@ export const RunCommand = effectCmd({
             if (event.type === "message.part.updated") {
               const part = event.properties.part
 
-              if (part.type === "tool" && part.state.status === "running") {
-                const start = part.state.time.start
-                const key = `${part.sessionID}:${part.callID}`
-                const previous = toolStartTimes.get(key)
-                if (previous === undefined || start < previous) toolStartTimes.set(key, start)
-              }
-
               if (part.type === "tool" && (part.state.status === "completed" || part.state.status === "error")) {
-                const key = `${part.sessionID}:${part.callID}`
-                const toolStart = toolStartTimes.get(key)
-                toolStartTimes.delete(key)
-                if (emit("tool_use", { sessionID: part.sessionID, part, toolStart })) continue
+                if (emit("tool_use", { sessionID: part.sessionID, part })) continue
               }
 
               if (part.sessionID !== sessionID) continue

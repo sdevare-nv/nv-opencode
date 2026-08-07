@@ -582,23 +582,17 @@ async function main() {
 
   const patch = await captureGitDiff(workspaceRoot)
   const benchRunTime = (Date.now() - startedAt) / 1000
-  const completionMetrics = await collectCompletionMetrics(completionsDir, modelName)
+  const completionMetrics = await collectCompletionMetrics(completionsDir)
   const perTurnMetrics = {
     response_latencies: completionMetrics.responseLatencies,
     action_execution_latencies: result.actionExecutionLatencies,
     token_usages: completionMetrics.tokenUsages,
   }
-  const totalModelCallTime = completionMetrics.responseLatencies.reduce((total, metric) => total + metric.latency, 0)
-  const totalCommandExecTime = result.actionExecutionLatencies.reduce((total, metric) => total + metric.latency, 0)
-
   // OpenCode has no separate OpenHands-style runtime create/connect/init phases.
   await updateNemoGymMetrics(process.env.NEMO_GYM_METRICS_FPATH, {
     create_runtime_time: 0,
     connect_to_runtime_time: 0,
     initialize_runtime_time: 0,
-    total_model_call_time: totalModelCallTime,
-    total_command_exec_time: totalCommandExecTime,
-    per_turn_metrics: perTurnMetrics,
   })
 
   const error: string | null = result.exitCode === 0 ? null : `opencode_exit_${result.exitCode}`

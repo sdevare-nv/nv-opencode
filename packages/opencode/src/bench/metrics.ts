@@ -1,8 +1,7 @@
 import { promises as fs } from "node:fs"
 import path from "node:path"
 
-export interface ResponseLatencyMetric {
-  model: string
+interface ResponseLatencyMetric {
   latency: number
   response_id: string
   request_kind: "agent" | "title" | "subagent"
@@ -26,19 +25,14 @@ export interface ActionExecutionLatencyMetric {
   timestamp: string
 }
 
-export interface TokenUsageMetric {
-  model: string
+interface TokenUsageMetric {
   prompt_tokens: number
   completion_tokens: number
   reasoning_tokens?: number
-  cache_read_tokens: number
-  cache_write_tokens: number
-  context_window: number
-  per_turn_token: number
   response_id: string
 }
 
-export interface CompletionMetrics {
+interface CompletionMetrics {
   responseLatencies: ResponseLatencyMetric[]
   tokenUsages: TokenUsageMetric[]
 }
@@ -46,15 +40,11 @@ export interface CompletionMetrics {
 interface CompletionDump {
   response?: {
     id?: unknown
-    model?: unknown
     usage?: {
       prompt_tokens?: unknown
       completion_tokens?: unknown
       completion_tokens_details?: {
         reasoning_tokens?: unknown
-      } | null
-      prompt_tokens_details?: {
-        cached_tokens?: unknown
       } | null
     }
   }
@@ -103,7 +93,7 @@ export function parseToolExecutionMetric(line: string): ActionExecutionLatencyMe
     return undefined
   }
 
-  const recordedStart = finiteNumber(event.toolStart)
+  const recordedStart = finiteNumber(state.time?.start)
   const end = finiteNumber(state.time?.end)
   const callID = typeof part.callID === "string" ? part.callID : typeof part.id === "string" ? part.id : undefined
   if (recordedStart === undefined || end === undefined || end < recordedStart || !callID) return undefined
@@ -135,10 +125,7 @@ export function parseToolExecutionMetric(line: string): ActionExecutionLatencyMe
   }
 }
 
-export async function collectCompletionMetrics(
-  completionsDir: string,
-  fallbackModel: string,
-): Promise<CompletionMetrics> {
+export async function collectCompletionMetrics(completionsDir: string): Promise<CompletionMetrics> {
   const records: Array<{
     startedAtSeconds: number
     timestampSeconds: number
@@ -170,7 +157,6 @@ export async function collectCompletionMetrics(
     )
       continue
 
-    const model = typeof dump.response?.model === "string" ? dump.response.model : fallbackModel
     const requestKind = dump.request_kind === "title" || dump.request_kind === "subagent" ? dump.request_kind : "agent"
     const sessionID = typeof dump.session_id === "string" ? dump.session_id : ""
     const parentSessionID = typeof dump.parent_session_id === "string" ? dump.parent_session_id : null
@@ -180,12 +166,10 @@ export async function collectCompletionMetrics(
     const reasoningTokens = optionalNonNegativeInteger(
       dump.response?.usage?.completion_tokens_details?.reasoning_tokens,
     )
-    const cacheReadTokens = nonNegativeInteger(dump.response?.usage?.prompt_tokens_details?.cached_tokens)
     records.push({
       startedAtSeconds: requestStartedAtSeconds,
       timestampSeconds,
       responseLatency: {
-        model,
         latency,
         response_id: responseID,
         request_kind: requestKind,
@@ -196,14 +180,9 @@ export async function collectCompletionMetrics(
         timestamp: isoTimestamp(timestampSeconds),
       },
       tokenUsage: {
-        model,
         prompt_tokens: promptTokens,
         completion_tokens: completionTokens,
         ...(reasoningTokens === undefined ? {} : { reasoning_tokens: reasoningTokens }),
-        cache_read_tokens: cacheReadTokens,
-        cache_write_tokens: 0,
-        context_window: 0,
-        per_turn_token: promptTokens + completionTokens,
         response_id: responseID,
       },
     })
