@@ -220,12 +220,105 @@ async function buildConfigDir(args: {
         // Allow the read+write tool set; disable web/skill/task to keep the
         // agent focused on local code editing.
         permission: {
-          // Glob-keyed `PermissionActionConfig` for file/shell access.
           edit: { "**": "allow" },
-          bash: { "*": "allow" },
-          // webfetch / websearch use a different schema (single action, not
-          // a glob map) and we already disable them in `tools` below — no
-          // need for an explicit entry here.
+          bash: {
+            "*": "allow",
+        
+            // process termination
+            "*killall*": "deny",
+            "*pkill*": "deny",
+            "*kill -1*": "deny",
+            "*kill 0*": "deny",
+        
+            // filesystem destruction
+            "*rm -rf /": "deny",
+            "*rm -rf /*": "deny",
+            "*rm -rf /bin*": "deny",
+            "*rm -rf /usr*": "deny",
+            "*rm -rf /etc*": "deny",
+            "*rm -rf /var*": "deny",
+            "*rm -rf /home*": "deny",
+            "*rm -rf /root*": "deny",
+            "*rm -rf /opt*": "deny",
+            "*rm -rf /lib*": "deny",
+            "*rm -rf /lib64*": "deny",
+            "*rm -rf /sbin*": "deny",
+            "*rm -rf /boot*": "deny",
+            "*rm -rf /dev*": "deny",
+            "*rm -rf /proc*": "deny",
+            "*rm -rf /sys*": "deny",
+        
+            // system control
+            // "*shutdown*": "deny",
+            // "*reboot*": "deny",
+            // "*poweroff*": "deny",
+            // "*halt*": "deny",
+            // "init 0*": "deny",
+            // "init 6*": "deny",
+        
+            // disk devices
+            "dd *of=/dev/sd*": "deny",
+            "dd *of=/dev/nvme*": "deny",
+            "dd *of=/dev/hd*": "deny",
+            "dd *of=/dev/null*": "deny",
+        
+            // git network
+            "*git fetch*": "deny",
+            "*git pull*": "deny",
+            "*git clone*": "deny",
+            "*git ls-remote*": "deny",
+            "*git remote add*": "deny",
+            "*git remote set-url*": "deny",
+            "*git remote set-head*": "deny",
+            "*git remote update*": "deny",
+            "*git remote rename*": "deny",
+            "*git remote set-branches*": "deny",
+            "*git submodule add*": "deny",
+            "*git submodule update*": "deny",
+            "*git submodule sync*": "deny",
+            "*git submodule init*": "deny",
+            "*git archive*--remote*": "deny",
+            "*git *://*": "deny",
+            "*git *@*:*": "deny",
+        
+            // git history mining
+            "*git log*--all*": "deny",
+            "*git log*--branches*": "deny",
+            "*git log*--remotes*": "deny",
+            "*git log*--walk-reflogs*": "deny",
+            "*git log*--grep*": "deny",
+            "*git rev-list*--all*": "deny",
+            "*git rev-list*--branches*": "deny",
+            "*git rev-list*--remotes*": "deny",
+            "*git rev-list*--grep*": "deny",
+            "*git shortlog*--all*": "deny",
+            "*git reflog*": "deny",
+            "*git cat-file*": "deny",
+            "*git fsck*": "deny",
+            "*git verify-pack*": "deny",
+            "*git unpack-objects*": "deny",
+            "*git cherry*": "deny",
+            "*git show*": "deny",
+            "*git merge-base*--is-ancestor*": "deny",
+            "*git branch*--contains*": "deny",
+            "*git tag*--contains*": "deny",
+            "*git for-each-ref*--contains*": "deny",
+        
+            // git internals (substring match on path)
+            "*.git/logs*": "deny",
+            "*.git/packed-refs*": "deny",
+            "*.git/ORIG_HEAD*": "deny",
+            "*.git/FETCH_HEAD*": "deny",
+            "*.git/refs*": "deny",
+        
+            // online lookups
+            "*curl *github.com*": "deny",
+            "*wget *github.com*": "deny",
+            "*curl *githubusercontent.com*": "deny",
+            "*wget *githubusercontent.com*": "deny",
+            "*curl *github.io*": "deny",
+            "*wget *github.io*": "deny"
+          }
         },
         tools: {
           bash: true,
@@ -293,7 +386,6 @@ function runOpencode(args: {
         `nemo-gym/${args.modelName}`,
         "--format",
         "json",
-        "--dangerously-skip-permissions",
         "--dir",
         args.workspaceRoot,
       ],
@@ -472,6 +564,10 @@ async function main() {
     OPENCODE_DB: ":memory:",
     OPENCODE_DATA: path.join(tmpRoot, "data"),
     OPENCODE_CONFIG: configFile,
+    // The benchmark already runs inside a SIF sandbox, so make that the
+    // security boundary. This final config override applies to subagents too.
+    OPENCODE_PERMISSION: JSON.stringify({ "*": "allow" }),
+
     // Disable opencode's built-in plugin loaders; the bench harness doesn't need them.
     OPENCODE_PURE: "1",
     // Skip the dynamic env block (working dir + Today's date) in the system
