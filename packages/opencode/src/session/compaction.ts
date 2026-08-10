@@ -233,7 +233,11 @@ export const layer: Layer.Layer<
       tokens: MessageV2.Assistant["tokens"]
       model: Provider.Model
     }) {
-      return overflow({ cfg: yield* config.get(), tokens: input.tokens, model: input.model })
+      const cfg = yield* config.get()
+      const result = overflow({ cfg, tokens: input.tokens, model: input.model })
+      // mercor: log the compaction trigger decision so we can verify when it fires
+      console.log(`[mercor][compaction] isOverflow tokens=${JSON.stringify(input.tokens)} -> overflow=${result}`)
+      return result
     })
 
     const estimate = Effect.fn("SessionCompaction.estimate")(function* (input: {
@@ -533,11 +537,12 @@ export const layer: Layer.Layer<
               agent: userMessage.agent,
               model: userMessage.model,
             })
+            console.log(`[mercor][compaction] post-compaction continuation fired session=${input.sessionID} overflow=${input.overflow}`)
             const text =
               (input.overflow
-                ? "The previous request exceeded the provider's size limit due to large media attachments. The conversation was compacted and media files were removed from context. If the user was asking about attached images or files, explain that the attachments were too large to process and suggest they try again with smaller or fewer files.\n\n"
+                ? "The previous request exceeded the provider's size limit due to large media attachments. The conversation was compacted and media files were removed from context. If the user was asking about attached images or files, explain that the attachments were too large to process.\n\n"
                 : "") +
-              "Continue if you have next steps, or stop and ask for clarification if you are unsure how to proceed."
+              "Continue with the next steps."
             yield* session.updatePart({
               id: PartID.ascending(),
               messageID: continueMsg.id,

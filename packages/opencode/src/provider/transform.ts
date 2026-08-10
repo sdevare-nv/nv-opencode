@@ -289,6 +289,8 @@ function normalizeMessages(
   }
 
   if (
+    // mercor: MERCOR_REASONING=off disables native reasoning interleaving (no propagation across turns)
+    process.env.MERCOR_REASONING !== "off" &&
     typeof model.capabilities.interleaved === "object" &&
     model.capabilities.interleaved.field &&
     model.api.npm !== "@openrouter/ai-sdk-provider"
