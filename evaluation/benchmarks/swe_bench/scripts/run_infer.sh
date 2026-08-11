@@ -113,6 +113,18 @@ fi
 if [ "${ENABLE_SUBAGENTS:-0}" = "1" ] || [ "${ENABLE_SUBAGENTS:-}" = "true" ]; then
     cmd+=(--enable-subagents)
 fi
+# Bridge: NeMo-Gym main never exports ENABLE_COMPACTION/OPENCODE_CONTEXT_LIMIT
+# and the agent container runs `apptainer --cleanenv`, so host env can't reach
+# us. The gym DOES export the full hydra config as YAML in NEMO_GYM_CONFIG_DICT,
+# so launcher-level `++opencode_bench_enable_compaction=true` /
+# `++opencode_bench_context_limit=N` overrides act as the knobs (top-level YAML
+# keys sit at column 0). Explicit env, when present, still wins.
+if [ -z "${ENABLE_COMPACTION:-}" ] && [ -n "${NEMO_GYM_CONFIG_DICT:-}" ]; then
+    ENABLE_COMPACTION=$(printf '%s\n' "$NEMO_GYM_CONFIG_DICT" | sed -n 's/^opencode_bench_enable_compaction:[[:space:]]*//p' | head -1)
+fi
+if [ -z "${OPENCODE_CONTEXT_LIMIT:-}" ] && [ -n "${NEMO_GYM_CONFIG_DICT:-}" ]; then
+    OPENCODE_CONTEXT_LIMIT=$(printf '%s\n' "$NEMO_GYM_CONFIG_DICT" | sed -n 's/^opencode_bench_context_limit:[[:space:]]*//p' | head -1)
+fi
 if [ "${ENABLE_COMPACTION:-0}" = "1" ] || [ "${ENABLE_COMPACTION:-}" = "true" ]; then
     cmd+=(--enable-compaction)
 fi
