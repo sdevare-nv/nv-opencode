@@ -503,6 +503,7 @@ function detectOpencodeBin(): string {
 }
 
 async function main() {
+  const initializeStartedAt = Date.now()
   const args = parseArgs(process.argv.slice(2))
   const instance = await readInstance(args.instanceDictPath, args.selectedId)
   // workspaceRoot is decided gym-side based on dataset_name; we use it verbatim.
@@ -541,7 +542,6 @@ async function main() {
     maxTokens: forcedMaxTokens,
   })
 
-  const startedAt = Date.now()
   const childEnv: NodeJS.ProcessEnv = {
     ...process.env,
     // Run-isolated opencode state.
@@ -571,6 +571,8 @@ async function main() {
   }
 
   const opencodeBin = detectOpencodeBin()
+  const initializeRuntimeTime = (Date.now() - initializeStartedAt) / 1000
+  const startedAt = Date.now()
   const result = await runOpencode({
     workspaceRoot,
     modelName,
@@ -588,11 +590,8 @@ async function main() {
     action_execution_latencies: result.actionExecutionLatencies,
     token_usages: completionMetrics.tokenUsages,
   }
-  // OpenCode has no separate OpenHands-style runtime create/connect/init phases.
   await updateNemoGymMetrics(process.env.NEMO_GYM_METRICS_FPATH, {
-    create_runtime_time: 0,
-    connect_to_runtime_time: 0,
-    initialize_runtime_time: 0,
+    initialize_runtime_time: initializeRuntimeTime,
   })
 
   const error: string | null = result.exitCode === 0 ? null : `opencode_exit_${result.exitCode}`
