@@ -173,6 +173,8 @@ async function buildConfigDir(args: {
   temperature?: number
   topP?: number
   maxTokens?: number
+  /** Dataset name — search/* datasets get web tools (tavily MCP + webfetch). */
+  dataset?: string
 }): Promise<{ tmpRoot: string; configFile: string }> {
   const tmpRoot = await fs.mkdtemp(path.join(os.tmpdir(), `bench-${args.instanceId}-`))
   await fs.mkdir(tmpRoot, { recursive: true })
@@ -180,6 +182,30 @@ async function buildConfigDir(args: {
   const systemPrompt = args.systemPromptPath
     ? await fs.readFile(args.systemPromptPath, "utf8")
     : DEFAULT_SYSTEM_PROMPT
+
+  // search/* datasets: wire the tavily MCP server, mirroring the harbor
+  // mercor-search configs (MCP key "web" -> tools web_search/web_extract/
+  // web_crawl/...), plus native webfetch. Assets are staged by the gym's
+  // setup_scripts/opencode.sh and mounted read-only at /opencode_setup/mcp;
+  // API keys rotate per-instance via a stable hash over instance_id.
+  const searchMode = (args.dataset ?? "").startsWith("search/")
+  const mcpEntry = "/opencode_setup/mcp/node_modules/tavily-mcp/build/index.js"
+  const keysFile = "/opencode_setup/mcp/tavily_keys.txt"
+  let tavilyKey: string | undefined
+  if (searchMode && existsSync(mcpEntry) && existsSync(keysFile)) {
+    const keys = (await fs.readFile(keysFile, "utf8"))
+      .split("\n")
+      .map((s) => s.trim())
+      .filter(Boolean)
+    if (keys.length > 0) {
+      let h = 0
+      for (const ch of args.instanceId) h = (h * 31 + ch.charCodeAt(0)) >>> 0
+      tavilyKey = keys[h % keys.length]
+      console.log(`[bench] search mode: tavily MCP enabled (key index ${h % keys.length} of ${keys.length})`)
+    }
+  } else if (searchMode) {
+    console.log(`[bench] search mode requested but MCP assets missing (${mcpEntry}); web tools unavailable`)
+  }
 
   const cfg: Record<string, unknown> = {
     $schema: "https://opencode.ai/config.json",
@@ -336,7 +362,10 @@ async function buildConfigDir(args: {
           grep: true,
           write: true,
           apply_patch: true,
-          webfetch: false,
+          // search/*: native webfetch on; search itself comes from the tavily
+          // MCP tools (web_*), same shape as the harbor configs. Native
+          // websearch stays off to match harbor and avoid backend surprises.
+          webfetch: searchMode,
           websearch: false,
           task: args.enableSubagents,
           skill: false,
@@ -354,6 +383,18 @@ async function buildConfigDir(args: {
     // only accounts for `auto`/overflow compaction boundaries, not prune.
     compaction: { auto: args.enableCompaction, prune: false },
     share: "manual",
+    ...(tavilyKey
+      ? {
+          mcp: {
+            web: {
+              type: "local",
+              enabled: true,
+              command: ["/opencode_setup/bun/bin/bun", mcpEntry],
+              environment: { TAVILY_API_KEY: tavilyKey },
+            },
+          },
+        }
+      : {}),
   }
 
   const configFile = path.join(tmpRoot, "opencode.jsonc")
@@ -553,6 +594,7 @@ async function main() {
     temperature: forcedTemperature,
     topP: forcedTopP,
     maxTokens: forcedMaxTokens,
+    dataset: args.dataset,
   })
 
   const startedAt = Date.now()
