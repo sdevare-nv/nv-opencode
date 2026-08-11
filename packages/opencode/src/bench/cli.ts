@@ -195,7 +195,9 @@ async function buildConfigDir(args: {
   if (searchMode && existsSync(mcpEntry) && existsSync(keysFile)) {
     const keys = (await fs.readFile(keysFile, "utf8"))
       .split("\n")
-      .map((s) => s.trim())
+      // the key cache stores JSON-style quoted strings ("tvly-prod-...") —
+      // strip surrounding quotes or the API rejects the key as invalid
+      .map((s) => s.trim().replace(/^"+|"+$/g, ""))
       .filter(Boolean)
     if (keys.length > 0) {
       let h = 0
