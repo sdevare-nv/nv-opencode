@@ -154,6 +154,15 @@ export class NemoGymLanguageModel implements LanguageModelV3 {
   // subagents spawned via the task tool get their own sessionID, so keeping
   // a Map keeps their dump filenames from clobbering the main session's.
   private readonly turnCounters: Map<string, number> = new Map()
+  // Per-session on-policy segment counter. A compaction summarization call
+  // rebuilds its prompt from stored history (stripped media, truncated tool
+  // output — see compaction.ts:406-411), so it is NOT a token-level
+  // continuation of the turn before it, and the turn after it conditions on
+  // the rewritten/summarized session history — neither is prefix-contiguous
+  // with what came before. Both edges of a compaction call are segment
+  // boundaries; see _nextSegment.
+  private readonly segmentCounters: Map<string, number> = new Map()
+  private readonly pendingSegmentBoundary: Map<string, boolean> = new Map()
 
   constructor(modelId: string, cfg: NemoGymLanguageModelConfig) {
     this.modelId = modelId
@@ -171,17 +180,45 @@ export class NemoGymLanguageModel implements LanguageModelV3 {
     return n
   }
 
-  private _sessionFromHeaders(headers: unknown): { sessionID: string; parentSessionID: string | undefined } {
+  // Isolates the compaction call as its own single-turn segment and starts a
+  // fresh segment for the turn immediately after it. Turns within an ordinary
+  // agentic back-and-forth (no compaction in between) stay in the same
+  // segment, so their prompt_token_ids stay prefix-contiguous — the training
+  // invariant nemo-rl asserts (nemo_rl/environments/nemo_gym.py:266-271).
+  private _nextSegment(sessionID: string, isCompactionTurn: boolean): { segment: number; boundaryReason: string | null } {
+    let segment = this.segmentCounters.get(sessionID) ?? 0
+    let boundaryReason: string | null = null
+    if (isCompactionTurn) {
+      segment += 1
+      boundaryReason = "compaction"
+      this.pendingSegmentBoundary.set(sessionID, true)
+    } else if (this.pendingSegmentBoundary.get(sessionID)) {
+      segment += 1
+      boundaryReason = "post_compaction"
+      this.pendingSegmentBoundary.set(sessionID, false)
+    }
+    this.segmentCounters.set(sessionID, segment)
+    return { segment, boundaryReason }
+  }
+
+  private _sessionFromHeaders(
+    headers: unknown,
+  ): { sessionID: string; parentSessionID: string | undefined; isCompactionTurn: boolean; isTitleTurn: boolean } {
     let sid = ""
     let pid: string | undefined
+    let isCompactionTurn = false
+    let isTitleTurn = false
     if (headers && typeof headers === "object") {
       const h = headers as Record<string, unknown>
       const v = h["x-session-affinity"] ?? h["X-Session-Affinity"]
       if (typeof v === "string") sid = v
       const p = h["x-parent-session-id"] ?? h["X-Parent-Session-Id"]
       if (typeof p === "string") pid = p
+      const k = h["x-turn-kind"] ?? h["X-Turn-Kind"]
+      isCompactionTurn = k === "compaction"
+      isTitleTurn = k === "title"
     }
-    return { sessionID: sid || "main", parentSessionID: pid }
+    return { sessionID: sid || "main", parentSessionID: pid, isCompactionTurn, isTitleTurn }
   }
 
   get supportedUrls() {
@@ -199,7 +236,7 @@ export class NemoGymLanguageModel implements LanguageModelV3 {
     if (!choice) throw new Error("nemo-gym: empty choices in response")
     const msg: ChatResponseChoice["message"] = choice.message ?? ({ role: "assistant" } as ChatResponseChoice["message"])
 
-    const providerSpecificFields = this._extractProviderFields(msg)
+    const providerSpecificFields = this._extractProviderFields(msg, session.isCompactionTurn)
     const providerMetadata = this._buildProviderMetadata(providerSpecificFields)
 
     const content: LanguageModelV3Content[] = []
@@ -256,7 +293,7 @@ export class NemoGymLanguageModel implements LanguageModelV3 {
           const msg: ChatResponseChoice["message"] =
             choice.message ?? ({ role: "assistant" } as ChatResponseChoice["message"])
 
-          const providerSpecificFields = self._extractProviderFields(msg)
+          const providerSpecificFields = self._extractProviderFields(msg, session.isCompactionTurn)
           const providerMetadata = self._buildProviderMetadata(providerSpecificFields)
 
           // Emit response-metadata first.
@@ -408,6 +445,19 @@ export class NemoGymLanguageModel implements LanguageModelV3 {
       )
       const n = Math.min(promptAssistants.length, wireAssistants.length)
       let mostRecentAttached = false
+      // Segment boundary rule: when the MOST RECENT token-bearing assistant
+      // is a compaction summary, attach NO token IDs to the wire at all. Its
+      // prompt_token_ids embed the entire PRE-compaction context, so
+      // re-attaching them would make the vllm proxy rebuild the old prefix
+      // and silently undo the compaction (the model never sees the compacted
+      // history; reported usage keeps growing; overflow re-fires -> infinite
+      // compact loop). Sending no IDs lets the proxy retokenize the compacted
+      // message list from scratch — the start of a NEW on-policy segment,
+      // matching the segment_index bump in _nextSegment. (Attaching an OLDER
+      // assistant's IDs instead would be equally wrong: they also describe
+      // the pre-compaction token stream.) Logged trajectories keep per-turn
+      // IDs for every assistant, including the summary — training needs them.
+      let wireAttachBlocked = false
       for (let i = n - 1; i >= 0; i--) {
         const parts = promptAssistants[i].content
         if (!Array.isArray(parts)) continue
@@ -415,9 +465,13 @@ export class NemoGymLanguageModel implements LanguageModelV3 {
           const md = part.providerOptions?.[this.provider]
           if (md && TOKEN_ID_FIELDS.every((f) => f in md)) {
             for (const f of TOKEN_ID_FIELDS) loggedAssistants[i][f] = md[f]
-            if (!mostRecentAttached) {
-              for (const f of TOKEN_ID_FIELDS) wireAssistants[i][f] = md[f]
-              mostRecentAttached = true
+            if (!mostRecentAttached && !wireAttachBlocked) {
+              if (md["is_compaction_turn"]) {
+                wireAttachBlocked = true
+              } else {
+                for (const f of TOKEN_ID_FIELDS) wireAssistants[i][f] = md[f]
+                mostRecentAttached = true
+              }
             }
             break
           }
@@ -556,13 +610,23 @@ export class NemoGymLanguageModel implements LanguageModelV3 {
     return new URL(p.replace(/^\//, ""), base).toString()
   }
 
-  private _extractProviderFields(msg: ChatResponseChoice["message"]): Record<string, unknown> {
+  private _extractProviderFields(
+    msg: ChatResponseChoice["message"],
+    isCompactionTurn: boolean = false,
+  ): Record<string, unknown> {
     const out: Record<string, unknown> = {}
     if (Array.isArray(msg.prompt_token_ids)) {
       for (const f of TOKEN_ID_FIELDS) {
         const v = (msg as Record<string, unknown>)[f]
         if (v !== undefined) out[f] = v
       }
+      // Mark token IDs born on a compaction (summary) turn: their
+      // prompt_token_ids embed the PRE-compaction context, so they must
+      // never be re-attached to the wire after the history is compacted —
+      // the vllm proxy would rebuild the old prefix from them and undo the
+      // compaction (context grows forever -> compaction death spiral). See
+      // the wire attach rule in _buildRequestParams.
+      if (isCompactionTurn) out["is_compaction_turn"] = true
     }
     return out
   }
@@ -611,9 +675,16 @@ export class NemoGymLanguageModel implements LanguageModelV3 {
     response: ChatResponse
     providerSpecificFields: Record<string, unknown>
     requestParams: Record<string, unknown>
-    session: { sessionID: string; parentSessionID: string | undefined }
+    session: { sessionID: string; parentSessionID: string | undefined; isCompactionTurn: boolean; isTitleTurn: boolean }
   }) {
+    // Title generation is a one-off, unrelated sub-conversation under the
+    // same sessionID (different system prompt, no tools) that happens BEFORE
+    // the real conversation's own seed — it shares no token-level continuity
+    // with the task trajectory at all. Exclude it entirely rather than let it
+    // consume turn 0 / pollute segment 0's prefix (see session/llm.ts).
+    if (args.session.isTitleTurn) return
     const turn = this._nextTurn(args.session.sessionID)
+    const { segment, boundaryReason } = this._nextSegment(args.session.sessionID, args.session.isCompactionTurn)
     if (this.cfg.onCompletion) {
       try {
         await this.cfg.onCompletion({ turn, ...args })
@@ -645,6 +716,12 @@ export class NemoGymLanguageModel implements LanguageModelV3 {
         session_id: args.session.sessionID,
         parent_session_id: args.session.parentSessionID ?? null,
         turn,
+        // On-policy segment this turn belongs to, and why a boundary was
+        // inserted before it (null = same segment as the previous turn).
+        // See _nextSegment. Absent/undefined on older dumps (pre-compaction-
+        // support) — readers should treat a missing field as segment 0.
+        segment_index: segment,
+        segment_boundary_reason: boundaryReason,
         timestamp: Date.now() / 1000,
       }
       const tmp = `${fpath}.tmp`

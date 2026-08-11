@@ -1403,6 +1403,15 @@ NOTE: At any point in time through this workflow you should feel free to ask the
         const slog = elog.with({ sessionID })
         let structured: unknown
         let step = 0
+        // NeMo-Gym: `agent.steps` (agent_max_turns) is meant to bound each
+        // on-policy SEGMENT independently, not the whole session -- a
+        // session that compacts N times should get up to N+1 segments'
+        // worth of turn budget, not share one pool across all of them
+        // (matches segment_index tracking in
+        // provider/sdk/nemo-gym/language-model.ts). Kept separate from
+        // `step` itself so the one-time title-generation trigger
+        // (`step === 1`) doesn't refire after every compaction.
+        let stepsSinceCompaction = 0
         const session = yield* sessions.get(sessionID).pipe(Effect.orDie)
 
         while (true) {
@@ -1448,6 +1457,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
           }
 
           step++
+          stepsSinceCompaction++
           if (step === 1)
             yield* title({
               session,
@@ -1473,6 +1483,8 @@ NOTE: At any point in time through this workflow you should feel free to ask the
               overflow: task.overflow,
             })
             if (result === "stop") break
+            // Fresh segment, fresh budget -- see stepsSinceCompaction above.
+            stepsSinceCompaction = 0
             continue
           }
 
@@ -1494,7 +1506,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
             throw error
           }
           const maxSteps = agent.steps ?? Infinity
-          const isLastStep = step >= maxSteps
+          const isLastStep = stepsSinceCompaction >= maxSteps
           msgs = yield* insertReminders({ messages: msgs, agent, session })
 
           const msg: MessageV2.Assistant = {

@@ -45,6 +45,16 @@ interface CliArgs {
   systemPromptPath?: string
   /** Enable opencode's `task` tool (spawns subagent sessions). */
   enableSubagents: boolean
+  /** Enable opencode's auto-compaction (context summarization). See segment_index in language-model.ts. */
+  enableCompaction: boolean
+  /**
+   * Testing knob: override the model's registered context window (default
+   * 131072) so compaction triggers after a handful of turns instead of
+   * ~99K tokens of real usage. Output limit scales down proportionally
+   * (context/4) to keep `usable = context - maxOutputTokens` positive —
+   * see session/overflow.ts.
+   */
+  contextLimit?: number
 }
 
 function parseArgs(argv: string[]): CliArgs {
@@ -54,6 +64,7 @@ function parseArgs(argv: string[]): CliArgs {
     dataset: "",
     split: "test",
     enableSubagents: false,
+    enableCompaction: false,
   }
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]
@@ -94,6 +105,12 @@ function parseArgs(argv: string[]): CliArgs {
         break
       case "--enable-subagents":
         out.enableSubagents = true
+        break
+      case "--enable-compaction":
+        out.enableCompaction = true
+        break
+      case "--context-limit":
+        out.contextLimit = parseInt(next(), 10)
         break
       default:
         if (a.startsWith("--")) throw new Error(`Unknown flag: ${a}`)
@@ -149,6 +166,9 @@ async function buildConfigDir(args: {
   maxTurns: number
   systemPromptPath?: string
   enableSubagents: boolean
+  enableCompaction: boolean
+  /** Testing knob — see CliArgs.contextLimit. */
+  contextLimit?: number
   /** Forced sampling params (RL on-policy requirement); from gym llm.model config. */
   temperature?: number
   topP?: number
@@ -187,7 +207,13 @@ async function buildConfigDir(args: {
           [args.modelName]: {
             id: args.modelName,
             name: args.modelName,
-            limit: { context: 131072, output: 32768 },
+            // contextLimit (testing only) scales output down proportionally
+            // (context/4) — leaving output untouched while shrinking context
+            // would make usable() = context - maxOutputTokens go negative,
+            // making every single turn look like overflow (session/overflow.ts).
+            limit: args.contextLimit
+              ? { context: args.contextLimit, output: Math.max(1000, Math.floor(args.contextLimit / 4)) }
+              : { context: 131072, output: 32768 },
             tool_call: true,
             temperature: true,
           },
@@ -320,7 +346,13 @@ async function buildConfigDir(args: {
         options: {},
       },
     },
-    compaction: { auto: false },
+    // `prune` is a separate mechanism from `auto`-compaction: it silently
+    // blanks old tool outputs in place with no session-level boundary event
+    // (compaction.ts PRUNE_MINIMUM/PRUNE_PROTECT), which would corrupt
+    // on-policy contiguity within a segment undetected. Force it off
+    // unconditionally — segment tracking (language-model.ts _nextSegment)
+    // only accounts for `auto`/overflow compaction boundaries, not prune.
+    compaction: { auto: args.enableCompaction, prune: false },
     share: "manual",
   }
 
@@ -516,6 +548,8 @@ async function main() {
     maxTurns: args.maxTurns,
     systemPromptPath: args.systemPromptPath,
     enableSubagents: args.enableSubagents,
+    enableCompaction: args.enableCompaction,
+    contextLimit: args.contextLimit,
     temperature: forcedTemperature,
     topP: forcedTopP,
     maxTokens: forcedMaxTokens,
@@ -531,7 +565,6 @@ async function main() {
     // The benchmark already runs inside a SIF sandbox, so make that the
     // security boundary. This final config override applies to subagents too.
     OPENCODE_PERMISSION: JSON.stringify({ "*": "allow" }),
-
     // Disable opencode's built-in plugin loaders; the bench harness doesn't need them.
     OPENCODE_PURE: "1",
     // Skip the dynamic env block (working dir + Today's date) in the system
