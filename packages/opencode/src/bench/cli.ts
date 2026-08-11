@@ -364,10 +364,10 @@ async function buildConfigDir(args: {
           grep: true,
           write: true,
           apply_patch: true,
-          // search/*: native webfetch on; search itself comes from the tavily
-          // MCP tools (web_*), same shape as the harbor configs. Native
-          // websearch stays off to match harbor and avoid backend surprises.
-          webfetch: searchMode,
+          // search/*: web access comes exclusively from the tavily MCP tools
+          // (web_tavily_search/extract), strict harbor parity. Native webfetch
+          // (direct HTTP) and websearch (exa-backed) both stay off.
+          webfetch: false,
           websearch: false,
           task: args.enableSubagents,
           skill: false,
