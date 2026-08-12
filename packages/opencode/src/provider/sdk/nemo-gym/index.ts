@@ -9,7 +9,14 @@
  * provider plumbing (Provider.Service.getModel) works without special-casing.
  */
 
-import { NemoGymLanguageModel, type NemoGymLanguageModelConfig, type NemoGymReplayTurn } from "./language-model"
+import {
+  NemoGymLanguageModel,
+  type NemoGymLanguageModelConfig,
+  type NemoGymReplayManifest,
+  type NemoGymReplayTurn,
+} from "./language-model"
+
+export type { NemoGymReplayManifest, NemoGymReplaySession, NemoGymReplayTurn } from "./language-model"
 
 export interface CreateNemoGymOptions {
   /** Base URL of the gym model server (`http://host:port`). */
@@ -38,18 +45,20 @@ export interface CreateNemoGymOptions {
   topP?: number
   /** Optional forced max_tokens; unset = no cap (vLLM generates to remaining context). */
   maxTokens?: number
-  /** Optional turn counter shared across all model calls in a session. */
+  /** Optional request-order counter shared across all live model calls. */
   turnCounter?: { next(): number }
   /** Optional callback invoked after each successful chat-completion. */
   onCompletion?: NemoGymLanguageModelConfig["onCompletion"]
   /**
-   * Scripted assistant turns to replay (main session only) before falling
+   * Scripted assistant turns to replay in the root session before falling
    * through to live HTTP calls. Set by the bench harness when the request
    * carries a prior trajectory to resume. See language-model.ts's docblock.
    */
   replayTurns?: NemoGymReplayTurn[]
   /** Subsequent user messages trailing the last replayed turn. See language-model.ts's docblock. */
   replayTrailingUserTexts?: string[]
+  /** Causal replay graph for child and nested-child sessions. */
+  replayManifest?: NemoGymReplayManifest
 }
 
 export interface NemoGymProvider {
@@ -78,6 +87,7 @@ export function createNemoGym(opts: CreateNemoGymOptions): NemoGymProvider {
         onCompletion: opts.onCompletion,
         replayTurns: opts.replayTurns,
         replayTrailingUserTexts: opts.replayTrailingUserTexts,
+        replayManifest: opts.replayManifest,
       })
     },
   }

@@ -26,7 +26,7 @@
  * instead of relying on session history to carry them forward.
  */
 
-import type { NemoGymReplayTurn } from "../provider/sdk/nemo-gym/language-model"
+import type { NemoGymReplayManifest, NemoGymReplayTurn } from "../provider/sdk/nemo-gym/language-model"
 
 export interface ReplayChatMessage {
   role: "system" | "user" | "assistant" | "tool"
@@ -88,5 +88,106 @@ export function parseReplayMessages(raw: string): ParsedReplay {
     initialUserText,
     replayTurns,
     ...(pendingUserTexts.length ? { trailingUserTexts: pendingUserTexts } : {}),
+  }
+}
+
+function replayManifestError(message: string): never {
+  throw new Error(`replay-subagents-file: ${message}`)
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+}
+
+/** Parse Gym's snake_case causal subagent manifest into provider replay queues. */
+export function parseReplayManifest(raw: string): NemoGymReplayManifest {
+  const input: unknown = JSON.parse(raw)
+  if (!isRecord(input)) return replayManifestError("expected an object")
+  if (input.version !== 1) return replayManifestError("version must be 1")
+  if (typeof input.root_session_id !== "string" || !input.root_session_id) {
+    return replayManifestError("root_session_id must be a non-empty string")
+  }
+  if (!Array.isArray(input.sessions)) return replayManifestError("sessions must be an array")
+
+  const seen = new Set<string>()
+  const seenSpawns = new Set<string>()
+  const sessions = input.sessions.map((value, index) => {
+    if (!isRecord(value)) return replayManifestError(`sessions[${index}] must be an object`)
+    const sessionId = value.session_id
+    const parentSessionId = value.parent_session_id
+    const spawnCallId = value.spawn_call_id
+    const spawnIndex = value.spawn_index
+    if (typeof sessionId !== "string" || !sessionId) {
+      return replayManifestError(`sessions[${index}].session_id must be a non-empty string`)
+    }
+    if (sessionId === input.root_session_id) {
+      return replayManifestError(`sessions[${index}].session_id duplicates root_session_id`)
+    }
+    if (seen.has(sessionId)) return replayManifestError(`duplicate session_id ${sessionId}`)
+    seen.add(sessionId)
+    if (typeof parentSessionId !== "string" || !parentSessionId) {
+      return replayManifestError(`sessions[${index}].parent_session_id must be a non-empty string`)
+    }
+    if (typeof spawnCallId !== "string" || !spawnCallId) {
+      return replayManifestError(`sessions[${index}].spawn_call_id must be a non-empty string`)
+    }
+    if (!Number.isInteger(spawnIndex) || (spawnIndex as number) < 0) {
+      return replayManifestError(`sessions[${index}].spawn_index must be a non-negative integer`)
+    }
+    const spawnKey = `${parentSessionId}\u0000${spawnCallId}`
+    if (seenSpawns.has(spawnKey)) {
+      return replayManifestError(`duplicate spawn_call_id ${spawnCallId} in parent ${parentSessionId}`)
+    }
+    seenSpawns.add(spawnKey)
+    if (!Array.isArray(value.messages)) {
+      return replayManifestError(`sessions[${index}].messages must be an array`)
+    }
+
+    const parsed = parseReplayMessages(JSON.stringify(value.messages))
+    return {
+      sessionId,
+      parentSessionId,
+      spawnCallId,
+      spawnIndex: spawnIndex as number,
+      ...(typeof value.subagent_type === "string" ? { subagentType: value.subagent_type } : {}),
+      messageCount: value.messages.length,
+      // Unlike the root session, every later child user message is recreated
+      // by replaying its parent's task(task_id=...) call. Injecting the text
+      // here as well would duplicate resumed-task prompts.
+      replayTurns: parsed.replayTurns.map(({ content, toolCalls }) => ({
+        content,
+        ...(toolCalls ? { toolCalls } : {}),
+      })),
+    }
+  })
+
+  const knownParents = new Set([input.root_session_id, ...sessions.map((session) => session.sessionId)])
+  for (const session of sessions) {
+    if (!knownParents.has(session.parentSessionId)) {
+      return replayManifestError(
+        `session ${session.sessionId} references unknown parent_session_id ${session.parentSessionId}`,
+      )
+    }
+  }
+
+  const reachable = new Set([input.root_session_id])
+  let changed = true
+  while (changed) {
+    changed = false
+    for (const session of sessions) {
+      if (reachable.has(session.sessionId) || !reachable.has(session.parentSessionId)) continue
+      reachable.add(session.sessionId)
+      changed = true
+    }
+  }
+  const unreachable = sessions.find((session) => !reachable.has(session.sessionId))
+  if (unreachable) {
+    return replayManifestError(`session ${unreachable.sessionId} is not reachable from root_session_id`)
+  }
+
+  return {
+    version: 1,
+    rootSessionId: input.root_session_id,
+    sessions,
   }
 }

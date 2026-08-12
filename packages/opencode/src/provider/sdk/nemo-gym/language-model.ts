@@ -18,10 +18,11 @@
  * openhands' `llm_completions/<id>/*.json` exactly so gym's
  * `get_openhands_trajectory_from_completions` reads it without changes.
  *
- * Replay: when `cfg.replayTurns` is set, the first N tool-bearing calls on
- * the top-level agentic-loop session (see `_popReplayTurn`'s docblock for
- * exactly how that's identified — it's not as simple as "sessionID is the
- * main session") are answered from that scripted queue instead of a real
+ * Replay: `cfg.replayTurns` drives the root session and `cfg.replayManifest`
+ * supplies one queue per recorded child. A live child is bound by its
+ * recorded parent plus the exact task call ID that created it, so parallel
+ * siblings and nested agents cannot consume one another's turns. Tool-bearing
+ * calls are answered from that session's scripted queue instead of a real
  * HTTP call — same synthesized-stream shape as a real response, so
  * opencode's *real* tool-execution path (streamText -> the AI-SDK `tool.execute` closures
  * built in session/prompt.ts's resolveTools()) runs each replayed tool call
@@ -133,6 +134,23 @@ export interface NemoGymReplayTurn {
   precedingUserTexts?: string[]
 }
 
+export interface NemoGymReplaySession {
+  sessionId: string
+  parentSessionId: string
+  spawnCallId: string
+  spawnIndex: number
+  subagentType?: string
+  messageCount: number
+  replayTurns: NemoGymReplayTurn[]
+  replayTrailingUserTexts?: string[]
+}
+
+export interface NemoGymReplayManifest {
+  version: 1
+  rootSessionId: string
+  sessions: NemoGymReplaySession[]
+}
+
 export interface NemoGymLanguageModelConfig {
   /** Provider id used to namespace providerMetadata. Defaults to "nemo-gym". */
   provider: string
@@ -180,7 +198,7 @@ export interface NemoGymLanguageModelConfig {
     requestParams: Record<string, unknown>
   }) => void | Promise<void>
   /**
-   * Scripted assistant turns to replay (main session only) before falling
+   * Scripted assistant turns to replay in the root session before falling
    * through to live HTTP calls. See the module docblock for why replayed
    * tool calls must run for real rather than just replaying recorded text.
    */
@@ -192,11 +210,34 @@ export interface NemoGymLanguageModelConfig {
    * NemoGymReplayTurn.precedingUserTexts. See the module docblock.
    */
   replayTrailingUserTexts?: string[]
+  /** Causal parent-task-call -> recorded child-session replay graph. */
+  replayManifest?: NemoGymReplayManifest
 }
 
 // ---------------------------------------------------------------------------
 // Implementation
 // ---------------------------------------------------------------------------
+
+interface ReplayState {
+  recordedSessionID: string
+  recordedParentSessionID?: string
+  spawnCallID?: string
+  spawnIndex?: number
+  subagentType?: string
+  messageCount: number
+  turns: NemoGymReplayTurn[]
+  trailingUserTexts?: string[]
+  index: number
+  pendingUserInjections: Array<{ beforeAssistantOrdinal: number; text: string }>
+  livePrefixMessageCount?: number
+}
+
+interface SessionHeaders {
+  sessionID: string
+  parentSessionID: string | undefined
+  parentToolCallID: string | undefined
+  agentName: string | undefined
+}
 
 export class NemoGymLanguageModel implements LanguageModelV3 {
   readonly specificationVersion = "v3"
@@ -209,19 +250,13 @@ export class NemoGymLanguageModel implements LanguageModelV3 {
   // subagents spawned via the task tool get their own sessionID, so keeping
   // a Map keeps their dump filenames from clobbering the main session's.
   private readonly turnCounters: Map<string, number> = new Map()
-  // Replay only ever applies to the main session (subagent sessions never
-  // existed in the recorded trajectory) — a single counter is sufficient.
-  private replayIndex = 0
-  // Precomputed once from cfg.replayTurns[i].precedingUserTexts /
-  // cfg.replayTrailingUserTexts. `beforeAssistantOrdinal` is the 0-based
-  // count of assistant-role messages that must already be in the wire
-  // message list before this text is inserted — i.e. insert right before
-  // the (beforeAssistantOrdinal + 1)-th assistant message overall, or at
-  // the end if that many don't exist yet. All replayed assistant turns are
-  // always fully present in session history by the time any live call
-  // happens, so this ordinal reliably resolves to the same chronological
-  // spot on every call — see _injectPendingUserMessages.
-  private readonly pendingUserInjections: Array<{ beforeAssistantOrdinal: number; text: string }> = []
+  private readonly replayByRecordedSession = new Map<string, ReplayState>()
+  private readonly replayChildBySpawn = new Map<string, string>()
+  private readonly liveToRecordedSession = new Map<string, string>()
+  private readonly recordedToLiveSession = new Map<string, string>()
+  private readonly rootRecordedSessionID: string | undefined
+  private globalTurn = 0
+  private readonly sessionStartGlobalTurn = new Map<string, number>()
 
   constructor(modelId: string, cfg: NemoGymLanguageModelConfig) {
     this.modelId = modelId
@@ -231,13 +266,33 @@ export class NemoGymLanguageModel implements LanguageModelV3 {
       requestTimeoutMs: cfg.requestTimeoutMs ?? 600_000,
       retries: cfg.retries ?? 3,
     }
-    cfg.replayTurns?.forEach((turn, i) => {
-      for (const text of turn.precedingUserTexts ?? []) {
-        this.pendingUserInjections.push({ beforeAssistantOrdinal: i, text })
-      }
-    })
-    for (const text of cfg.replayTrailingUserTexts ?? []) {
-      this.pendingUserInjections.push({ beforeAssistantOrdinal: cfg.replayTurns?.length ?? 0, text })
+    this.rootRecordedSessionID = cfg.replayManifest?.rootSessionId ?? (cfg.replayTurns ? "__main__" : undefined)
+    if (this.rootRecordedSessionID) {
+      this.replayByRecordedSession.set(
+        this.rootRecordedSessionID,
+        this._makeReplayState({
+          recordedSessionID: this.rootRecordedSessionID,
+          messageCount: 0,
+          turns: cfg.replayTurns ?? [],
+          trailingUserTexts: cfg.replayTrailingUserTexts,
+        }),
+      )
+    }
+    for (const session of cfg.replayManifest?.sessions ?? []) {
+      this.replayByRecordedSession.set(
+        session.sessionId,
+        this._makeReplayState({
+          recordedSessionID: session.sessionId,
+          recordedParentSessionID: session.parentSessionId,
+          spawnCallID: session.spawnCallId,
+          spawnIndex: session.spawnIndex,
+          subagentType: session.subagentType,
+          messageCount: session.messageCount,
+          turns: session.replayTurns,
+          trailingUserTexts: session.replayTrailingUserTexts,
+        }),
+      )
+      this.replayChildBySpawn.set(this._spawnKey(session.parentSessionId, session.spawnCallId), session.sessionId)
     }
   }
 
@@ -247,54 +302,110 @@ export class NemoGymLanguageModel implements LanguageModelV3 {
     return n
   }
 
-  private _sessionFromHeaders(headers: unknown): { sessionID: string; parentSessionID: string | undefined } {
+  private _nextGlobalTurn(sessionID: string): { globalTurn: number; sessionStartGlobalTurn: number } {
+    const globalTurn = this.cfg.turnCounter?.next() ?? this.globalTurn++
+    const sessionStartGlobalTurn = this.sessionStartGlobalTurn.get(sessionID) ?? globalTurn
+    this.sessionStartGlobalTurn.set(sessionID, sessionStartGlobalTurn)
+    return { globalTurn, sessionStartGlobalTurn }
+  }
+
+  private _makeReplayState(
+    input: Omit<ReplayState, "index" | "pendingUserInjections" | "livePrefixMessageCount">,
+  ): ReplayState {
+    return {
+      ...input,
+      index: 0,
+      pendingUserInjections: [
+        ...input.turns.flatMap((turn, i) =>
+          (turn.precedingUserTexts ?? []).map((text) => ({ beforeAssistantOrdinal: i, text })),
+        ),
+        ...(input.trailingUserTexts ?? []).map((text) => ({
+          beforeAssistantOrdinal: input.turns.length,
+          text,
+        })),
+      ],
+    }
+  }
+
+  private _spawnKey(parentSessionID: string, callID: string): string {
+    return `${parentSessionID}\u0000${callID}`
+  }
+
+  private _sessionFromHeaders(headers: unknown): SessionHeaders {
     let sid = ""
     let pid: string | undefined
+    let callID: string | undefined
+    let agentName: string | undefined
     if (headers && typeof headers === "object") {
       const h = headers as Record<string, unknown>
       const v = h["x-session-affinity"] ?? h["X-Session-Affinity"]
       if (typeof v === "string") sid = v
       const p = h["x-parent-session-id"] ?? h["X-Parent-Session-Id"]
       if (typeof p === "string") pid = p
+      const c = h["x-parent-tool-call-id"] ?? h["X-Parent-Tool-Call-Id"]
+      if (typeof c === "string") callID = c
+      const a = h["x-opencode-agent"] ?? h["X-Opencode-Agent"]
+      if (typeof a === "string") agentName = a
     }
-    return { sessionID: sid || "main", parentSessionID: pid }
+    return { sessionID: sid || "main", parentSessionID: pid, parentToolCallID: callID, agentName }
   }
 
-  // Pops the next scripted turn for the main agentic-loop session, or
-  // undefined once the replay queue is exhausted / not applicable. Advances
-  // state, so call at most once per doStream / doGenerate invocation.
-  //
-  // Two exclusions matter here, both confirmed against a real opencode run
-  // (not just unit tests against a bare LanguageModelV3CallOptions):
-  //
-  // 1. Subagent sessions: excluded via `parentSessionID` being set, NOT via
-  //    comparing `sessionID` to a sentinel string. `session/llm.ts` sets
-  //    `x-session-affinity: input.sessionID` UNCONDITIONALLY for every call
-  //    on the nemo-gym provider — including the top-level/main session's own
-  //    calls — so sessionID is *always* the real session id (e.g. "ses_..."),
-  //    never a fallback "main" placeholder. A `sessionID !== "main"` check
-  //    (the original implementation here) is therefore always true and
-  //    replay never fires at all in a real run — a subagent session is the
-  //    one with `parentSessionID` set, not the one whose id happens to equal
-  //    a literal string.
-  // 2. Auxiliary no-tool calls on the SAME session: opencode's own `runLoop`
-  //    forks off title-generation and summary-generation model calls on step
-  //    1 (`session/prompt.ts`), using the same session id as the real
-  //    agentic loop. Those race against the loop's own first call and, if
-  //    unfiltered, silently consume scripted turns meant for the real agent
-  //    (confirmed: they reach this provider before the real loop's first
-  //    call in practice). They're reliably distinguishable because they
-  //    never pass `tools` — only the real agentic loop resolves and sends
-  //    the tool registry — so `hasTools` gates them out.
-  private _popReplayTurn(
-    session: { sessionID: string; parentSessionID: string | undefined },
-    hasTools: boolean,
-  ): NemoGymReplayTurn | undefined {
-    if (!this.cfg.replayTurns) return undefined
-    if (session.parentSessionID) return undefined
+  private _bindReplaySession(liveSessionID: string, recordedSessionID: string): ReplayState | undefined {
+    const existing = this.liveToRecordedSession.get(liveSessionID)
+    if (existing && existing !== recordedSessionID) {
+      throw new Error(
+        `nemo-gym replay: live session ${liveSessionID} is already bound to ${existing}, cannot bind ${recordedSessionID}`,
+      )
+    }
+    const otherLive = this.recordedToLiveSession.get(recordedSessionID)
+    if (otherLive && otherLive !== liveSessionID) {
+      throw new Error(
+        `nemo-gym replay: recorded session ${recordedSessionID} is already bound to ${otherLive}, cannot bind ${liveSessionID}`,
+      )
+    }
+    this.liveToRecordedSession.set(liveSessionID, recordedSessionID)
+    this.recordedToLiveSession.set(recordedSessionID, liveSessionID)
+    return this.replayByRecordedSession.get(recordedSessionID)
+  }
+
+  private _replayState(session: SessionHeaders): ReplayState | undefined {
+    const recorded = this.liveToRecordedSession.get(session.sessionID)
+    if (recorded) return this.replayByRecordedSession.get(recorded)
+    if (!session.parentSessionID) {
+      if (!this.rootRecordedSessionID) return undefined
+      return this._bindReplaySession(session.sessionID, this.rootRecordedSessionID)
+    }
+    if (!session.parentToolCallID) return undefined
+    const recordedParent = this.liveToRecordedSession.get(session.parentSessionID)
+    if (!recordedParent) return undefined
+    const recordedChild = this.replayChildBySpawn.get(this._spawnKey(recordedParent, session.parentToolCallID))
+    if (!recordedChild) return undefined
+    return this._bindReplaySession(session.sessionID, recordedChild)
+  }
+
+  // Auxiliary title/summary calls never pass tools, so they must not consume
+  // a session's scripted agentic-loop turns.
+  private _popReplayTurn(session: SessionHeaders, hasTools: boolean): NemoGymReplayTurn | undefined {
     if (!hasTools) return undefined
-    if (this.replayIndex >= this.cfg.replayTurns.length) return undefined
-    return this.cfg.replayTurns[this.replayIndex++]
+    const replay = this._replayState(session)
+    if (!replay || replay.index >= replay.turns.length) return undefined
+    return replay.turns[replay.index++]
+  }
+
+  private _rewriteTaskResumeArguments(tool: NonNullable<NemoGymReplayTurn["toolCalls"]>[number]): string {
+    if (tool.name !== "task" || !tool.arguments.includes('"task_id"')) return tool.arguments
+    let parsed: unknown
+    try {
+      parsed = JSON.parse(tool.arguments)
+    } catch {
+      return tool.arguments
+    }
+    if (!parsed || typeof parsed !== "object") return tool.arguments
+    const input = parsed as Record<string, unknown>
+    if (typeof input.task_id !== "string") return tool.arguments
+    const liveSessionID = this.recordedToLiveSession.get(input.task_id)
+    if (!liveSessionID) return tool.arguments
+    return JSON.stringify({ ...input, task_id: liveSessionID })
   }
 
   private _messageFromReplayTurn(turn: NemoGymReplayTurn): ChatResponseChoice["message"] {
@@ -304,7 +415,7 @@ export class NemoGymLanguageModel implements LanguageModelV3 {
       tool_calls: turn.toolCalls?.map((tc) => ({
         id: tc.id,
         type: "function" as const,
-        function: { name: tc.name, arguments: tc.arguments },
+        function: { name: tc.name, arguments: this._rewriteTaskResumeArguments(tc) },
       })),
     }
   }
@@ -370,10 +481,10 @@ export class NemoGymLanguageModel implements LanguageModelV3 {
   // the outgoing message list, in place. Processed in descending ordinal
   // order so inserting a later text doesn't shift the index about to be
   // looked up for an earlier one.
-  private _injectPendingUserMessages(messages: ChatRequestMessage[]): void {
-    if (!this.pendingUserInjections.length) return
+  private _injectPendingUserMessages(messages: ChatRequestMessage[], replay: ReplayState | undefined): void {
+    if (!replay?.pendingUserInjections.length) return
     const byOrdinal = new Map<number, string[]>()
-    for (const { beforeAssistantOrdinal, text } of this.pendingUserInjections) {
+    for (const { beforeAssistantOrdinal, text } of replay.pendingUserInjections) {
       const list = byOrdinal.get(beforeAssistantOrdinal) ?? []
       list.push(text)
       byOrdinal.set(beforeAssistantOrdinal, list)
@@ -435,7 +546,8 @@ export class NemoGymLanguageModel implements LanguageModelV3 {
       }
     }
 
-    const { warnings, loggedMessages, requestParams } = await this._buildRequestParams(options)
+    const { warnings, loggedMessages, requestParams, globalTurn, sessionStartGlobalTurn } =
+      await this._buildRequestParams(options, session)
     const { responseJson } = await this._postChat(requestParams)
 
     const choice = responseJson.choices[0]
@@ -466,6 +578,8 @@ export class NemoGymLanguageModel implements LanguageModelV3 {
       providerSpecificFields,
       requestParams,
       session,
+      globalTurn,
+      sessionStartGlobalTurn,
     })
 
     return {
@@ -507,7 +621,8 @@ export class NemoGymLanguageModel implements LanguageModelV3 {
       return { stream, request: { body: "{}" }, response: {} }
     }
 
-    const { warnings, loggedMessages, requestParams } = await this._buildRequestParams(options)
+    const { warnings, loggedMessages, requestParams, globalTurn, sessionStartGlobalTurn } =
+      await this._buildRequestParams(options, session)
 
     // Fire the HTTP call eagerly so any error surfaces synchronously when the
     // stream is consumed. We then synthesize parts in `start`.
@@ -546,6 +661,8 @@ export class NemoGymLanguageModel implements LanguageModelV3 {
             providerSpecificFields,
             requestParams,
             session,
+            globalTurn,
+            sessionStartGlobalTurn,
           })
 
           controller.enqueue({
@@ -580,13 +697,15 @@ export class NemoGymLanguageModel implements LanguageModelV3 {
   // Helpers
   // -----------------------------------------------------------------------
 
-  private async _buildRequestParams(options: LanguageModelV3CallOptions): Promise<{
+  private async _buildRequestParams(options: LanguageModelV3CallOptions, session: SessionHeaders): Promise<{
     warnings: SharedV3Warning[]
     messages: ChatRequestMessage[]
     loggedMessages: ChatRequestMessage[]
     tools: unknown
     toolChoice: unknown
     requestParams: Record<string, unknown>
+    globalTurn: number
+    sessionStartGlobalTurn: number
   }> {
     const warnings: SharedV3Warning[] = []
     // Reuse opencode's existing OpenAI-compatible message converter so all
@@ -618,7 +737,8 @@ export class NemoGymLanguageModel implements LanguageModelV3 {
     // identically. Re-applied on every call — nothing else carries them
     // forward — at a position fixed relative to the replayed assistant
     // turns, so they land in the same chronological spot every time.
-    this._injectPendingUserMessages(messages as ChatRequestMessage[])
+    const replay = this._replayState(session)
+    this._injectPendingUserMessages(messages as ChatRequestMessage[], replay)
 
     // Token-ID handling, mirroring OpenHands' nemo_gym_client.py exactly:
     //   - WIRE request: token IDs on the MOST RECENT assistant message only
@@ -639,6 +759,9 @@ export class NemoGymLanguageModel implements LanguageModelV3 {
     const loggedMessages = (messages as Array<Record<string, unknown>>).map((m) => ({
       ...m,
     })) as unknown as ChatRequestMessage[]
+    if (replay && options.tools?.length && replay.livePrefixMessageCount === undefined) {
+      replay.livePrefixMessageCount = loggedMessages.length
+    }
     {
       const promptAssistants = options.prompt.filter((m) => m.role === "assistant")
       const wireAssistants = (messages as Array<Record<string, unknown>>).filter((m) => m["role"] === "assistant")
@@ -720,7 +843,15 @@ export class NemoGymLanguageModel implements LanguageModelV3 {
       if (requestParams[k] === undefined) delete requestParams[k]
     }
 
-    return { warnings, messages, loggedMessages, tools, toolChoice, requestParams }
+    return {
+      warnings,
+      messages,
+      loggedMessages,
+      tools,
+      toolChoice,
+      requestParams,
+      ...this._nextGlobalTurn(session.sessionID),
+    }
   }
 
   private async _postChat(params: Record<string, unknown>): Promise<{ responseJson: ChatResponse }> {
@@ -850,9 +981,16 @@ export class NemoGymLanguageModel implements LanguageModelV3 {
     response: ChatResponse
     providerSpecificFields: Record<string, unknown>
     requestParams: Record<string, unknown>
-    session: { sessionID: string; parentSessionID: string | undefined }
+    session: SessionHeaders
+    globalTurn: number
+    sessionStartGlobalTurn: number
   }) {
     const turn = this._nextTurn(args.session.sessionID)
+    const replay = this._replayState(args.session)
+    const recordedParentSessionID = replay?.recordedParentSessionID ??
+      (args.session.parentSessionID
+        ? this.liveToRecordedSession.get(args.session.parentSessionID)
+        : undefined)
     if (this.cfg.onCompletion) {
       try {
         await this.cfg.onCompletion({ turn, ...args })
@@ -883,7 +1021,15 @@ export class NemoGymLanguageModel implements LanguageModelV3 {
         kwargs,
         session_id: args.session.sessionID,
         parent_session_id: args.session.parentSessionID ?? null,
+        recorded_session_id: replay?.recordedSessionID ?? null,
+        recorded_parent_session_id: recordedParentSessionID ?? null,
+        spawn_call_id: replay?.spawnCallID ?? args.session.parentToolCallID ?? null,
+        spawn_index: replay?.spawnIndex ?? null,
+        subagent_type: replay?.subagentType ?? args.session.agentName ?? null,
+        replay_prefix_message_count: replay?.livePrefixMessageCount ?? null,
         turn,
+        global_turn: args.globalTurn,
+        session_start_global_turn: args.sessionStartGlobalTurn,
         timestamp: Date.now() / 1000,
       }
       const tmp = `${fpath}.tmp`

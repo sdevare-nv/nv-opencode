@@ -28,8 +28,8 @@ import { bootstrapRepoIfMissing } from "./bootstrap_repo"
 // opencode's built-in anthropic system prompt — Bun bundles .txt as a string.
 // Used as the default when no --system-prompt override is passed.
 import PROMPT_ANTHROPIC from "../session/prompt/anthropic.txt"
-import type { NemoGymReplayTurn } from "../provider/sdk/nemo-gym/language-model"
-import { parseReplayMessages } from "./replay"
+import type { NemoGymReplayManifest, NemoGymReplayTurn } from "../provider/sdk/nemo-gym/language-model"
+import { parseReplayManifest, parseReplayMessages } from "./replay"
 
 interface CliArgs {
   instanceDictPath: string
@@ -52,6 +52,8 @@ interface CliArgs {
    * before continuing live (trajectory resume). See language-model.ts.
    */
   replayMessagesFile?: string
+  /** Causal parent-task-call -> recorded child-session replay graph. */
+  replaySubagentsFile?: string
 }
 
 function parseArgs(argv: string[]): CliArgs {
@@ -104,6 +106,9 @@ function parseArgs(argv: string[]): CliArgs {
         break
       case "--replay-messages-file":
         out.replayMessagesFile = next()
+        break
+      case "--replay-subagents-file":
+        out.replaySubagentsFile = next()
         break
       default:
         if (a.startsWith("--")) throw new Error(`Unknown flag: ${a}`)
@@ -167,6 +172,8 @@ async function buildConfigDir(args: {
   replayTurns?: NemoGymReplayTurn[]
   /** Subsequent user messages trailing the last replayed turn. */
   replayTrailingUserTexts?: string[]
+  /** Per-recorded-subagent replay queues and their parent task-call links. */
+  replayManifest?: NemoGymReplayManifest
 }): Promise<{ tmpRoot: string; configFile: string }> {
   const tmpRoot = await fs.mkdtemp(path.join(os.tmpdir(), `bench-${args.instanceId}-`))
   await fs.mkdir(tmpRoot, { recursive: true })
@@ -200,6 +207,7 @@ async function buildConfigDir(args: {
           ...(args.replayTrailingUserTexts?.length
             ? { replayTrailingUserTexts: args.replayTrailingUserTexts }
             : {}),
+          ...(args.replayManifest ? { replayManifest: args.replayManifest } : {}),
         },
         models: {
           [args.modelName]: {
@@ -530,6 +538,7 @@ async function main() {
   let userPrompt: string
   let replayTurns: NemoGymReplayTurn[] | undefined
   let replayTrailingUserTexts: string[] | undefined
+  let replayManifest: NemoGymReplayManifest | undefined
   if (args.replayMessagesFile) {
     const raw = await fs.readFile(args.replayMessagesFile, "utf8")
     const parsed = parseReplayMessages(raw)
@@ -541,6 +550,9 @@ async function main() {
     // on dataset_name); we just read it as-is and pass it to opencode.
     userPrompt = await fs.readFile(args.userMessageFile, "utf8")
   }
+  if (args.replaySubagentsFile) {
+    replayManifest = parseReplayManifest(await fs.readFile(args.replaySubagentsFile, "utf8"))
+  }
 
   const { tmpRoot, configFile } = await buildConfigDir({
     instanceId: instance.instance_id,
@@ -549,12 +561,13 @@ async function main() {
     completionsDir,
     maxTurns: args.maxTurns,
     systemPromptPath: args.systemPromptPath,
-    enableSubagents: args.enableSubagents,
+    enableSubagents: args.enableSubagents || Boolean(replayManifest?.sessions.length),
     temperature: forcedTemperature,
     topP: forcedTopP,
     maxTokens: forcedMaxTokens,
     replayTurns,
     replayTrailingUserTexts,
+    replayManifest,
   })
 
   const startedAt = Date.now()

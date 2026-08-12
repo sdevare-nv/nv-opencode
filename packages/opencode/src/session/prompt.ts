@@ -943,6 +943,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
         id: input.messageID ?? MessageID.ascending(),
         role: "user",
         sessionID: input.sessionID,
+        parentToolCallID: input.parentToolCallID,
         time: { created: Date.now() },
         tools: input.tools,
         agent: ag.name,
@@ -1584,6 +1585,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
               permission: session.permission,
               sessionID,
               parentSessionID: session.parentID,
+              parentToolCallID: lastUser.parentToolCallID,
               system,
               messages: [...modelMsgs, ...(isLastStep ? [{ role: "user" as const, content: MAX_STEPS }] : [])],
               tools,
@@ -1811,6 +1813,7 @@ const ModelRef = Schema.Struct({
 export const PromptInput = Schema.Struct({
   sessionID: SessionID,
   messageID: Schema.optional(MessageID),
+  parentToolCallID: Schema.optional(Schema.String),
   model: Schema.optional(ModelRef),
   agent: Schema.optional(Schema.String),
   noReply: Schema.optional(Schema.Boolean),

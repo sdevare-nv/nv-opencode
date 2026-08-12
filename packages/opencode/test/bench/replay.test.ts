@@ -1,5 +1,5 @@
 import { describe, test, expect } from "bun:test"
-import { parseReplayMessages, replayMessageText } from "@/bench/replay"
+import { parseReplayManifest, parseReplayMessages, replayMessageText } from "@/bench/replay"
 
 describe("replayMessageText", () => {
   test("returns string content verbatim", () => {
@@ -140,5 +140,81 @@ describe("parseReplayMessages", () => {
   test("throws when no user message is present", () => {
     const raw = JSON.stringify([{ role: "system", content: "sys prompt" }])
     expect(() => parseReplayMessages(raw)).toThrow(/no user message/)
+  })
+})
+
+describe("parseReplayManifest", () => {
+  test("parses child and nested-child replay queues without relying on array order", () => {
+    const manifest = parseReplayManifest(
+      JSON.stringify({
+        version: 1,
+        root_session_id: "recorded-root",
+        sessions: [
+          {
+            session_id: "recorded-grandchild",
+            parent_session_id: "recorded-child",
+            spawn_call_id: "call_nested",
+            spawn_index: 0,
+            subagent_type: "explore",
+            messages: [
+              { role: "user", content: "nested work" },
+              { role: "assistant", content: "nested result" },
+            ],
+          },
+          {
+            session_id: "recorded-child",
+            parent_session_id: "recorded-root",
+            spawn_call_id: "call_child",
+            spawn_index: 1,
+            subagent_type: "general",
+            messages: [
+              { role: "user", content: "child work" },
+              {
+                role: "assistant",
+                content: null,
+                tool_calls: [
+                  {
+                    id: "call_nested",
+                    function: { name: "task", arguments: '{"prompt":"nested work"}' },
+                  },
+                ],
+              },
+            ],
+          },
+        ],
+      }),
+    )
+
+    expect(manifest.rootSessionId).toBe("recorded-root")
+    expect(manifest.sessions.map((session) => session.sessionId)).toEqual([
+      "recorded-grandchild",
+      "recorded-child",
+    ])
+    expect(manifest.sessions[0]).toMatchObject({
+      parentSessionId: "recorded-child",
+      spawnCallId: "call_nested",
+      messageCount: 2,
+      replayTurns: [{ content: "nested result" }],
+    })
+  })
+
+  test("rejects an unlinked parent", () => {
+    expect(() =>
+      parseReplayManifest(
+        JSON.stringify({
+          version: 1,
+          root_session_id: "root",
+          sessions: [
+            {
+              session_id: "child",
+              parent_session_id: "missing",
+              spawn_call_id: "call_1",
+              spawn_index: 0,
+              messages: [{ role: "user", content: "work" }],
+            },
+          ],
+        }),
+      ),
+    ).toThrow(/unknown parent_session_id/)
   })
 })

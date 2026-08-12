@@ -285,4 +285,201 @@ describe("NemoGymLanguageModel replay", () => {
     const messages = bodies[0].messages as unknown as Array<{ role: string; content?: unknown }>
     expect(messages[messages.length - 1]).toMatchObject({ role: "user", content: "now also check the tests" })
   })
+
+  test("binds parallel child queues by parent task call id, not manifest or execution order", async () => {
+    const fetchSpy = mock(async () => {
+      throw new Error("network should not be called during replay")
+    })
+    // @ts-expect-error test override
+    globalThis.fetch = fetchSpy
+
+    const model = new NemoGymLanguageModel("test-model", {
+      provider: "nemo-gym",
+      baseURL: "http://unused.invalid",
+      replayTurns: [{
+        content: null,
+        toolCalls: [
+          { id: "call_a", name: "task", arguments: '{"prompt":"A","subagent_type":"general"}' },
+          { id: "call_b", name: "task", arguments: '{"prompt":"B","subagent_type":"explore"}' },
+        ],
+      }],
+      replayManifest: {
+        version: 1,
+        rootSessionId: "recorded-root",
+        // Deliberately opposite the parent task-call order.
+        sessions: [
+          {
+            sessionId: "recorded-b",
+            parentSessionId: "recorded-root",
+            spawnCallId: "call_b",
+            spawnIndex: 1,
+            messageCount: 2,
+            replayTurns: [{ content: "result B" }],
+          },
+          {
+            sessionId: "recorded-a",
+            parentSessionId: "recorded-root",
+            spawnCallId: "call_a",
+            spawnIndex: 0,
+            messageCount: 2,
+            replayTurns: [{ content: "result A" }],
+          },
+        ],
+      },
+    })
+
+    await drain(
+      (await model.doStream({ ...CALL_OPTIONS, headers: { "x-session-affinity": "live-root" } })).stream,
+    )
+
+    const childB = await drain(
+      (
+        await model.doStream({
+          ...CALL_OPTIONS,
+          headers: {
+            "x-session-affinity": "live-b",
+            "x-parent-session-id": "live-root",
+            "x-parent-tool-call-id": "call_b",
+          },
+        })
+      ).stream,
+    )
+    const childA = await drain(
+      (
+        await model.doStream({
+          ...CALL_OPTIONS,
+          headers: {
+            "x-session-affinity": "live-a",
+            "x-parent-session-id": "live-root",
+            "x-parent-tool-call-id": "call_a",
+          },
+        })
+      ).stream,
+    )
+
+    expect(childB.find((part) => part.type === "text-delta")).toMatchObject({ delta: "result B" })
+    expect(childA.find((part) => part.type === "text-delta")).toMatchObject({ delta: "result A" })
+    expect(fetchSpy).not.toHaveBeenCalled()
+  })
+
+  test("recursively binds a nested subagent to the task call in its recorded parent", async () => {
+    const model = new NemoGymLanguageModel("test-model", {
+      provider: "nemo-gym",
+      baseURL: "http://unused.invalid",
+      replayTurns: [{
+        content: null,
+        toolCalls: [{ id: "call_child", name: "task", arguments: "{}" }],
+      }],
+      replayManifest: {
+        version: 1,
+        rootSessionId: "recorded-root",
+        sessions: [
+          {
+            sessionId: "recorded-child",
+            parentSessionId: "recorded-root",
+            spawnCallId: "call_child",
+            spawnIndex: 0,
+            messageCount: 3,
+            replayTurns: [{
+              content: null,
+              toolCalls: [{ id: "call_grandchild", name: "task", arguments: "{}" }],
+            }],
+          },
+          {
+            sessionId: "recorded-grandchild",
+            parentSessionId: "recorded-child",
+            spawnCallId: "call_grandchild",
+            spawnIndex: 0,
+            messageCount: 2,
+            replayTurns: [{ content: "nested result" }],
+          },
+        ],
+      },
+    })
+
+    await drain(
+      (await model.doStream({ ...CALL_OPTIONS, headers: { "x-session-affinity": "live-root" } })).stream,
+    )
+    await drain(
+      (
+        await model.doStream({
+          ...CALL_OPTIONS,
+          headers: {
+            "x-session-affinity": "live-child",
+            "x-parent-session-id": "live-root",
+            "x-parent-tool-call-id": "call_child",
+          },
+        })
+      ).stream,
+    )
+    const nested = await drain(
+      (
+        await model.doStream({
+          ...CALL_OPTIONS,
+          headers: {
+            "x-session-affinity": "live-grandchild",
+            "x-parent-session-id": "live-child",
+            "x-parent-tool-call-id": "call_grandchild",
+          },
+        })
+      ).stream,
+    )
+
+    expect(nested.find((part) => part.type === "text-delta")).toMatchObject({ delta: "nested result" })
+  })
+
+  test("rewrites a recorded task_id to the bound live child session id when resuming it", async () => {
+    const model = new NemoGymLanguageModel("test-model", {
+      provider: "nemo-gym",
+      baseURL: "http://unused.invalid",
+      replayTurns: [
+        { content: null, toolCalls: [{ id: "call_child", name: "task", arguments: "{}" }] },
+        {
+          content: null,
+          toolCalls: [
+            {
+              id: "call_resume",
+              name: "task",
+              arguments: '{"task_id":"recorded-child","prompt":"continue"}',
+            },
+          ],
+        },
+      ],
+      replayManifest: {
+        version: 1,
+        rootSessionId: "recorded-root",
+        sessions: [
+          {
+            sessionId: "recorded-child",
+            parentSessionId: "recorded-root",
+            spawnCallId: "call_child",
+            spawnIndex: 0,
+            messageCount: 2,
+            replayTurns: [{ content: "first child result" }],
+          },
+        ],
+      },
+    })
+
+    const rootHeaders = { "x-session-affinity": "live-root" }
+    await drain((await model.doStream({ ...CALL_OPTIONS, headers: rootHeaders })).stream)
+    await drain(
+      (
+        await model.doStream({
+          ...CALL_OPTIONS,
+          headers: {
+            "x-session-affinity": "live-child",
+            "x-parent-session-id": "live-root",
+            "x-parent-tool-call-id": "call_child",
+          },
+        })
+      ).stream,
+    )
+    const resumed = await drain((await model.doStream({ ...CALL_OPTIONS, headers: rootHeaders })).stream)
+    const call = resumed.find((part) => part.type === "tool-call")
+    expect(call).toMatchObject({
+      toolCallId: "call_resume",
+      input: '{"task_id":"live-child","prompt":"continue"}',
+    })
+  })
 })
