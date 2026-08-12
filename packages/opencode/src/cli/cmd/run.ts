@@ -306,9 +306,15 @@ export const RunCommand = effectCmd({
   handler: Effect.fn("Cli.run")(function* (args) {
     const agentSvc = yield* Agent.Service
     yield* Effect.promise(async () => {
-      let message = [...args.message, ...(args["--"] || [])]
-        .map((arg) => (arg.includes(" ") ? `"${arg.replace(/"/g, '\\"')}"` : arg))
-        .join(" ")
+      // A single positional message must pass through VERBATIM — the quote
+      // re-wrapping below exists only to reconstruct a shell-word-split
+      // multi-arg message, and it corrupts single-arg prompts (bench rollouts
+      // pass the whole rendered user message as one argv).
+      const messageArgs = [...args.message, ...(args["--"] || [])]
+      let message =
+        messageArgs.length === 1
+          ? String(messageArgs[0])
+          : messageArgs.map((arg) => (arg.includes(" ") ? `"${arg.replace(/"/g, '\\"')}"` : arg)).join(" ")
 
       const directory = (() => {
         if (!args.dir) return undefined
@@ -344,7 +350,12 @@ export const RunCommand = effectCmd({
         }
       }
 
-      if (!process.stdin.isTTY) message += "\n" + (await Bun.stdin.text())
+      if (!process.stdin.isTTY) {
+        // Don't append anything when stdin is empty (bench spawns with
+        // stdio "ignore") — the unconditional version added a stray "\n".
+        const stdinText = await Bun.stdin.text()
+        if (stdinText) message += "\n" + stdinText
+      }
 
       if (message.trim().length === 0 && !args.command) {
         UI.error("You must provide a message or a command")
