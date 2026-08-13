@@ -96,7 +96,16 @@ type CompletedCompaction = {
 function summaryText(message: MessageV2.WithParts) {
   const text = message.parts
     .filter((part): part is MessageV2.TextPart => part.type === "text")
-    .map((part) => part.text.trim())
+    // Drop the summarizer's own chain-of-thought. Under the nemo-gym provider
+    // the model server re-wraps reasoning INTO content as <think>…</think>, so
+    // it arrives as an ordinary text part (upstream stacks get a real reasoning
+    // part, which this filter already excludes). Left in, the CoT becomes part
+    // of the stored summary and is then quoted verbatim into the next
+    // compaction's <previous-summary> block — a USER message, which the gym's
+    // assistant-only strip never cleans. Measured: 95% of GLM compaction
+    // prompts carried a leaked CoT block, ~16% of the anchor's tokens; the
+    // reference harness shows 0/205.
+    .map((part) => part.text.replace(/<think>[\s\S]*?<\/think>/g, "").trim())
     .filter(Boolean)
     .join("\n\n")
     .trim()
