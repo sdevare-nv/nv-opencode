@@ -192,6 +192,7 @@ async function buildConfigDir(args: {
   const mcpEntry = "/opencode_setup/mcp/node_modules/tavily-mcp/build/index.js"
   const keysFile = "/opencode_setup/mcp/tavily_keys.txt"
   let tavilyKey: string | undefined
+  let tavilyDefaults: string | undefined
   if (searchMode && existsSync(mcpEntry) && existsSync(keysFile)) {
     const keys = (await fs.readFile(keysFile, "utf8"))
       .split("\n")
@@ -204,6 +205,15 @@ async function buildConfigDir(args: {
       for (const ch of args.instanceId) h = (h * 31 + ch.charCodeAt(0)) >>> 0
       tavilyKey = keys[h % keys.length]
       console.log(`[bench] search mode: tavily MCP enabled (key index ${h % keys.length} of ${keys.length})`)
+      // Search parameters, staged next to the keys by the gym setup script.
+      const defaultsFile = "/opencode_setup/mcp/tavily_default_parameters.json"
+      if (existsSync(defaultsFile)) {
+        tavilyDefaults = (await fs.readFile(defaultsFile, "utf8")).trim()
+        const n = (JSON.parse(tavilyDefaults).exclude_domains ?? []).length
+        console.log(`[bench] tavily DEFAULT_PARAMETERS loaded (${n} excluded domains)`)
+      } else {
+        console.log(`[bench] WARNING: ${defaultsFile} missing — tavily runs with library defaults`)
+      }
     }
   } else if (searchMode) {
     console.log(`[bench] search mode requested but MCP assets missing (${mcpEntry}); web tools unavailable`)
@@ -392,7 +402,15 @@ async function buildConfigDir(args: {
               type: "local",
               enabled: true,
               command: ["/opencode_setup/bun/bin/bun", mcpEntry],
-              environment: { TAVILY_API_KEY: tavilyKey },
+              // Harbor parity (_launch_core.sh:62-66): tavily-mcp reads
+              // DEFAULT_PARAMETERS for every call. Without it we silently ran
+              // basic-depth, no raw content, default result count, and NO
+              // opt-out domain exclusions. Values come from the gym-side env
+              // (staged by setup_scripts/opencode.sh) so they stay launcher-visible.
+              environment: {
+                TAVILY_API_KEY: tavilyKey,
+                ...(tavilyDefaults ? { DEFAULT_PARAMETERS: tavilyDefaults } : {}),
+              },
             },
           },
         }
