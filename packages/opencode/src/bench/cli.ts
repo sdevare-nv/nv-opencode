@@ -454,7 +454,6 @@ function runOpencode(args: {
       [
         args.opencodeBin,
         "run",
-        args.message,
         "--agent",
         args.agent,
         "--model",
@@ -463,6 +462,23 @@ function runOpencode(args: {
         "json",
         "--dir",
         args.workspaceRoot,
+        // The message goes LAST, behind `--`, so a question that STARTS WITH "-"
+        // is not parsed as a flag. BrowseComp writes some questions as bullet
+        // lists, e.g. "- An article published sometime between ..."; without this,
+        // run's yargs reads it as an unknown option, prints usage and exits 1 in
+        // ~3s with no trajectory at all. Measured on glm51_bc400_iron_c45k_s15:
+        // exactly the 4 leading-dash questions of 400 (0188/0283/0288/0307) died
+        // this way, in EVERY attempt — a silent 1% loss no retry can recover.
+        //
+        // `--` must come AFTER every flag: index.ts:75 sets
+        // parserConfiguration({"populate--": true}), so everything following it
+        // lands in args["--"]. Putting it before --agent/--model/--dir would
+        // swallow those flags into the message instead of applying them.
+        // run.ts:313 merges args["--"] into the message, and because this leaves
+        // exactly ONE element the message still takes run.ts's verbatim path
+        // (:314-317) and is never re-quoted.
+        "--",
+        args.message,
       ],
       {
         env: args.env,
