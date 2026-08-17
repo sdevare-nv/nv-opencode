@@ -125,11 +125,17 @@ fi
 if [ -z "${OPENCODE_CONTEXT_LIMIT:-}" ] && [ -n "${NEMO_GYM_CONFIG_DICT:-}" ]; then
     OPENCODE_CONTEXT_LIMIT=$(printf '%s\n' "$NEMO_GYM_CONFIG_DICT" | sed -n 's/^opencode_bench_context_limit:[[:space:]]*//p' | head -1)
 fi
+if [ -z "${OPENCODE_INPUT_LIMIT:-}" ] && [ -n "${NEMO_GYM_CONFIG_DICT:-}" ]; then
+    OPENCODE_INPUT_LIMIT=$(printf '%s\n' "$NEMO_GYM_CONFIG_DICT" | sed -n 's/^opencode_bench_input_limit:[[:space:]]*//p' | head -1)
+fi
 if [ "${ENABLE_COMPACTION:-0}" = "1" ] || [ "${ENABLE_COMPACTION:-}" = "true" ]; then
     cmd+=(--enable-compaction)
 fi
 if [ -n "${OPENCODE_CONTEXT_LIMIT:-}" ]; then
     cmd+=(--context-limit "$OPENCODE_CONTEXT_LIMIT")
+fi
+if [ -n "${OPENCODE_INPUT_LIMIT:-}" ]; then
+    cmd+=(--input-limit "$OPENCODE_INPUT_LIMIT")
 fi
 
 echo "Executing: ${cmd[*]}"

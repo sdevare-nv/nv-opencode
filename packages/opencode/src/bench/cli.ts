@@ -55,6 +55,17 @@ interface CliArgs {
    * see session/overflow.ts.
    */
   contextLimit?: number
+  /**
+   * Independently registers the model's `input` limit (harbor's mechanism —
+   * see huggingface provider configs). When set, session/overflow.ts's
+   * usable() takes the `input - reserved` branch instead of falling back to
+   * `context - maxOutputTokens`, letting compaction trigger far below what
+   * context/output alone can reach (output is hard-capped at OUTPUT_TOKEN_MAX
+   * = 32000, so context - maxOutputTokens can't go below context - 32000).
+   * Does not affect contextLimit or the wire-level max_tokens (cfg.maxTokens)
+   * — independent knobs.
+   */
+  inputLimit?: number
 }
 
 function parseArgs(argv: string[]): CliArgs {
@@ -111,6 +122,9 @@ function parseArgs(argv: string[]): CliArgs {
         break
       case "--context-limit":
         out.contextLimit = parseInt(next(), 10)
+        break
+      case "--input-limit":
+        out.inputLimit = parseInt(next(), 10)
         break
       default:
         if (a.startsWith("--")) throw new Error(`Unknown flag: ${a}`)
@@ -169,6 +183,8 @@ async function buildConfigDir(args: {
   enableCompaction: boolean
   /** Testing knob — see CliArgs.contextLimit. */
   contextLimit?: number
+  /** See CliArgs.inputLimit. */
+  inputLimit?: number
   /** Forced sampling params (RL on-policy requirement); from gym llm.model config. */
   temperature?: number
   topP?: number
@@ -249,9 +265,16 @@ async function buildConfigDir(args: {
             // (context/4) — leaving output untouched while shrinking context
             // would make usable() = context - maxOutputTokens go negative,
             // making every single turn look like overflow (session/overflow.ts).
-            limit: args.contextLimit
-              ? { context: args.contextLimit, output: Math.max(1000, Math.floor(args.contextLimit / 4)) }
-              : { context: 131072, output: 32768 },
+            // inputLimit is independent: when set, session/overflow.ts's usable()
+            // takes the `input - reserved` branch instead of `context -
+            // maxOutputTokens`, so compaction can trigger well below what
+            // context/output alone can reach (output is hard-capped at 32000).
+            limit: {
+              ...(args.contextLimit
+                ? { context: args.contextLimit, output: Math.max(1000, Math.floor(args.contextLimit / 4)) }
+                : { context: 131072, output: 32768 }),
+              ...(args.inputLimit !== undefined ? { input: args.inputLimit } : {}),
+            },
             tool_call: true,
             temperature: true,
           },
@@ -627,6 +650,7 @@ async function main() {
     enableSubagents: args.enableSubagents,
     enableCompaction: args.enableCompaction,
     contextLimit: args.contextLimit,
+    inputLimit: args.inputLimit,
     temperature: forcedTemperature,
     topP: forcedTopP,
     maxTokens: forcedMaxTokens,
