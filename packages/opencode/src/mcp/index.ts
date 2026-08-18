@@ -654,7 +654,12 @@ export const layer = Layer.effect(
 
             const timeout = entry?.timeout ?? defaultTimeout
             for (const mcpTool of listed) {
-              result[sanitize(clientName) + "_" + sanitize(mcpTool.name)] = convertMcpTool(mcpTool, client, timeout)
+              // Strip the tavily-mcp server's redundant "tavily_" vendor prefix so
+              // the exposed tools are web_search/web_extract/... (harbor parity),
+              // not web_tavily_search. Stock npm tavily-mcp reports tavily_* names;
+              // harbor's build reported bare names. No-op for other servers.
+              const bare = mcpTool.name.replace(/^tavily_/, "")
+              result[sanitize(clientName) + "_" + sanitize(bare)] = convertMcpTool(mcpTool, client, timeout)
             }
           }),
         { concurrency: "unbounded" },
