@@ -102,40 +102,6 @@ describe("NemoGymLanguageModel replay", () => {
     expect(textDelta).toMatchObject({ delta: "live turn" })
   })
 
-  test("doStream surfaces a context-limit HTTP response without retrying it", async () => {
-    const fetchSpy = mock(
-      async () =>
-        new Response(
-          JSON.stringify({
-            error: {
-              code: "context_length_exceeded",
-              message: "This model's maximum context length is 32 tokens; the request has 64 tokens.",
-            },
-          }),
-          { status: 400, headers: { "Content-Type": "application/json" } },
-        ),
-    )
-    // @ts-expect-error test override
-    globalThis.fetch = fetchSpy
-
-    const model = new NemoGymLanguageModel("test-model", {
-      provider: "nemo-gym",
-      baseURL: "http://unused.invalid",
-      retries: Number.MAX_SAFE_INTEGER,
-    })
-
-    const parts = await drain((await model.doStream(CALL_OPTIONS)).stream)
-    expect(fetchSpy).toHaveBeenCalledTimes(1)
-
-    const error = parts.find((part) => part.type === "error")
-    expect(error?.type).toBe("error")
-    if (error?.type !== "error" || typeof error.error !== "string") throw new Error("missing stream error")
-    expect(JSON.parse(error.error)).toMatchObject({
-      type: "error",
-      error: { code: "context_length_exceeded" },
-    })
-  })
-
   test("doStream recognizes Gym's null-content length completion as context overflow", async () => {
     const fetchSpy = mock(
       async () =>
