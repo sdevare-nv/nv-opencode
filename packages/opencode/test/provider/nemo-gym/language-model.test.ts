@@ -70,15 +70,16 @@ describe("NemoGymLanguageModel replay", () => {
   })
 
   test("doStream falls through to the real HTTP path once the replay queue is exhausted", async () => {
-    const fetchSpy = mock(async () =>
-      new Response(
-        JSON.stringify({
-          id: "resp_1",
-          model: "test-model",
-          choices: [{ finish_reason: "stop", message: { role: "assistant", content: "live turn" } }],
-        }),
-        { status: 200, headers: { "Content-Type": "application/json" } },
-      ),
+    const fetchSpy = mock(
+      async () =>
+        new Response(
+          JSON.stringify({
+            id: "resp_1",
+            model: "test-model",
+            choices: [{ finish_reason: "stop", message: { role: "assistant", content: "live turn" } }],
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        ),
     )
     // @ts-expect-error test override
     globalThis.fetch = fetchSpy
@@ -101,16 +102,90 @@ describe("NemoGymLanguageModel replay", () => {
     expect(textDelta).toMatchObject({ delta: "live turn" })
   })
 
+  test("doStream surfaces a context-limit HTTP response without retrying it", async () => {
+    const fetchSpy = mock(
+      async () =>
+        new Response(
+          JSON.stringify({
+            error: {
+              code: "context_length_exceeded",
+              message: "This model's maximum context length is 32 tokens; the request has 64 tokens.",
+            },
+          }),
+          { status: 400, headers: { "Content-Type": "application/json" } },
+        ),
+    )
+    // @ts-expect-error test override
+    globalThis.fetch = fetchSpy
+
+    const model = new NemoGymLanguageModel("test-model", {
+      provider: "nemo-gym",
+      baseURL: "http://unused.invalid",
+      retries: Number.MAX_SAFE_INTEGER,
+    })
+
+    const parts = await drain((await model.doStream(CALL_OPTIONS)).stream)
+    expect(fetchSpy).toHaveBeenCalledTimes(1)
+
+    const error = parts.find((part) => part.type === "error")
+    expect(error?.type).toBe("error")
+    if (error?.type !== "error" || typeof error.error !== "string") throw new Error("missing stream error")
+    expect(JSON.parse(error.error)).toMatchObject({
+      type: "error",
+      error: { code: "context_length_exceeded" },
+    })
+  })
+
+  test("doStream recognizes Gym's null-content length completion as context overflow", async () => {
+    const fetchSpy = mock(
+      async () =>
+        new Response(
+          JSON.stringify({
+            id: "chtcmpl-123",
+            model: "test-model",
+            choices: [
+              {
+                index: 0,
+                finish_reason: "length",
+                message: { role: "assistant", content: null, tool_calls: null },
+              },
+            ],
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        ),
+    )
+    // @ts-expect-error test override
+    globalThis.fetch = fetchSpy
+
+    const model = new NemoGymLanguageModel("test-model", {
+      provider: "nemo-gym",
+      baseURL: "http://unused.invalid",
+      retries: Number.MAX_SAFE_INTEGER,
+    })
+
+    const parts = await drain((await model.doStream(CALL_OPTIONS)).stream)
+    expect(fetchSpy).toHaveBeenCalledTimes(1)
+
+    const error = parts.find((part) => part.type === "error")
+    expect(error?.type).toBe("error")
+    if (error?.type !== "error" || typeof error.error !== "string") throw new Error("missing stream error")
+    expect(JSON.parse(error.error)).toMatchObject({
+      type: "error",
+      error: { code: "context_length_exceeded" },
+    })
+  })
+
   test("replay is scoped to the top-level session — a subagent session (x-parent-session-id set) calls through to HTTP", async () => {
-    const fetchSpy = mock(async () =>
-      new Response(
-        JSON.stringify({
-          id: "resp_1",
-          model: "test-model",
-          choices: [{ finish_reason: "stop", message: { role: "assistant", content: "subagent turn" } }],
-        }),
-        { status: 200, headers: { "Content-Type": "application/json" } },
-      ),
+    const fetchSpy = mock(
+      async () =>
+        new Response(
+          JSON.stringify({
+            id: "resp_1",
+            model: "test-model",
+            choices: [{ finish_reason: "stop", message: { role: "assistant", content: "subagent turn" } }],
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        ),
     )
     // @ts-expect-error test override
     globalThis.fetch = fetchSpy
@@ -136,15 +211,16 @@ describe("NemoGymLanguageModel replay", () => {
   })
 
   test("an auxiliary no-tool call on the main session (e.g. opencode's own title/summary generation) does not consume the replay queue", async () => {
-    const fetchSpy = mock(async () =>
-      new Response(
-        JSON.stringify({
-          id: "resp_1",
-          model: "test-model",
-          choices: [{ finish_reason: "stop", message: { role: "assistant", content: "Fix the parser bug" } }],
-        }),
-        { status: 200, headers: { "Content-Type": "application/json" } },
-      ),
+    const fetchSpy = mock(
+      async () =>
+        new Response(
+          JSON.stringify({
+            id: "resp_1",
+            model: "test-model",
+            choices: [{ finish_reason: "stop", message: { role: "assistant", content: "Fix the parser bug" } }],
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        ),
     )
     // @ts-expect-error test override
     globalThis.fetch = fetchSpy
@@ -212,7 +288,13 @@ describe("NemoGymLanguageModel replay", () => {
       // Attached to turn 0 (ordinal 0): must land BEFORE the first assistant
       // message in the eventual wire request, i.e. right after the initial
       // user message.
-      replayTurns: [{ content: null, toolCalls: [{ id: "call_1", name: "bash", arguments: "{}" }], precedingUserTexts: ["please also fix the other bug"] }],
+      replayTurns: [
+        {
+          content: null,
+          toolCalls: [{ id: "call_1", name: "bash", arguments: "{}" }],
+          precedingUserTexts: ["please also fix the other bug"],
+        },
+      ],
     })
 
     // Turn 0 replays without hitting the network.
@@ -296,13 +378,15 @@ describe("NemoGymLanguageModel replay", () => {
     const model = new NemoGymLanguageModel("test-model", {
       provider: "nemo-gym",
       baseURL: "http://unused.invalid",
-      replayTurns: [{
-        content: null,
-        toolCalls: [
-          { id: "call_a", name: "task", arguments: '{"prompt":"A","subagent_type":"general"}' },
-          { id: "call_b", name: "task", arguments: '{"prompt":"B","subagent_type":"explore"}' },
-        ],
-      }],
+      replayTurns: [
+        {
+          content: null,
+          toolCalls: [
+            { id: "call_a", name: "task", arguments: '{"prompt":"A","subagent_type":"general"}' },
+            { id: "call_b", name: "task", arguments: '{"prompt":"B","subagent_type":"explore"}' },
+          ],
+        },
+      ],
       replayManifest: {
         version: 1,
         rootSessionId: "recorded-root",
@@ -328,9 +412,7 @@ describe("NemoGymLanguageModel replay", () => {
       },
     })
 
-    await drain(
-      (await model.doStream({ ...CALL_OPTIONS, headers: { "x-session-affinity": "live-root" } })).stream,
-    )
+    await drain((await model.doStream({ ...CALL_OPTIONS, headers: { "x-session-affinity": "live-root" } })).stream)
 
     const childB = await drain(
       (
@@ -366,10 +448,12 @@ describe("NemoGymLanguageModel replay", () => {
     const model = new NemoGymLanguageModel("test-model", {
       provider: "nemo-gym",
       baseURL: "http://unused.invalid",
-      replayTurns: [{
-        content: null,
-        toolCalls: [{ id: "call_child", name: "task", arguments: "{}" }],
-      }],
+      replayTurns: [
+        {
+          content: null,
+          toolCalls: [{ id: "call_child", name: "task", arguments: "{}" }],
+        },
+      ],
       replayManifest: {
         version: 1,
         rootSessionId: "recorded-root",
@@ -380,10 +464,12 @@ describe("NemoGymLanguageModel replay", () => {
             spawnCallId: "call_child",
             spawnIndex: 0,
             messageCount: 3,
-            replayTurns: [{
-              content: null,
-              toolCalls: [{ id: "call_grandchild", name: "task", arguments: "{}" }],
-            }],
+            replayTurns: [
+              {
+                content: null,
+                toolCalls: [{ id: "call_grandchild", name: "task", arguments: "{}" }],
+              },
+            ],
           },
           {
             sessionId: "recorded-grandchild",
@@ -397,9 +483,7 @@ describe("NemoGymLanguageModel replay", () => {
       },
     })
 
-    await drain(
-      (await model.doStream({ ...CALL_OPTIONS, headers: { "x-session-affinity": "live-root" } })).stream,
-    )
+    await drain((await model.doStream({ ...CALL_OPTIONS, headers: { "x-session-affinity": "live-root" } })).stream)
     await drain(
       (
         await model.doStream({

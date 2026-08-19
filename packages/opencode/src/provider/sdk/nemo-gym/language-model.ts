@@ -114,6 +114,72 @@ interface ChatResponse {
   usage?: ChatResponseUsage
 }
 
+/**
+ * `_postChat` normally retries transport/server failures because training
+ * backpressure can last for minutes. A context-limit response is terminal,
+ * though: retrying the same request can never succeed. Preserve it as the
+ * structured stream-error shape consumed by MessageV2.parseStreamError so
+ * SessionProcessor can surface ContextOverflowError immediately.
+ */
+class ContextOverflowResponseError extends Error {
+  constructor(streamError: string) {
+    super(streamError)
+    this.name = "ContextOverflowResponseError"
+  }
+}
+
+const CONTEXT_OVERFLOW_RESPONSE_PATTERNS = [
+  /context[_ -]?length[_ -]?exceeded/i,
+  /maximum context length/i,
+  /exceeds? (?:the )?context window/i,
+  /context window exceeded/i,
+  /input length.*context length/i,
+  /prompt (?:is )?too long/i,
+  /request entity too large/i,
+]
+
+function contextOverflowStreamError(message: string): string {
+  return JSON.stringify({
+    type: "error",
+    error: {
+      code: "context_length_exceeded",
+      message: message.slice(0, 2_000) || "Input exceeds context window of this model",
+    },
+  })
+}
+
+function normalizeContextOverflowResponse(status: number, text: string): string | undefined {
+  let code = ""
+  let message = text
+  try {
+    const body = JSON.parse(text) as Record<string, unknown>
+    const error = body.error
+    if (error && typeof error === "object") {
+      const obj = error as Record<string, unknown>
+      if (obj.code !== undefined) code = String(obj.code)
+      if (typeof obj.message === "string") message = obj.message
+    } else if (typeof error === "string") {
+      message = error
+    }
+    if (!code && body.code !== undefined) code = String(body.code)
+    if (message === text && typeof body.message === "string") message = body.message
+    if (message === text && typeof body.detail === "string") message = body.detail
+  } catch {}
+
+  const evidence = `${code}\n${message}\n${text}`
+  if (status !== 413 && !CONTEXT_OVERFLOW_RESPONSE_PATTERNS.some((pattern) => pattern.test(evidence))) return
+
+  return contextOverflowStreamError(message)
+}
+
+function isGymContextOverflowCompletion(choice: ChatResponseChoice): boolean {
+  // Gym's vLLM wrapper translates an upstream context-overflow HTTP 400 into
+  // a successful empty completion. The stable signal it returns is exactly
+  // this pair. `content == null` alone is not enough because valid tool-call
+  // completions also normally carry null assistant content.
+  return choice.finish_reason === "length" && choice.message?.content == null
+}
+
 // ---------------------------------------------------------------------------
 // Config
 // ---------------------------------------------------------------------------
@@ -552,7 +618,13 @@ export class NemoGymLanguageModel implements LanguageModelV3 {
 
     const choice = responseJson.choices[0]
     if (!choice) throw new Error("nemo-gym: empty choices in response")
-    const msg: ChatResponseChoice["message"] = choice.message ?? ({ role: "assistant" } as ChatResponseChoice["message"])
+    if (isGymContextOverflowCompletion(choice)) {
+      throw new ContextOverflowResponseError(
+        contextOverflowStreamError("NeMo Gym returned an empty length completion for an overlong context"),
+      )
+    }
+    const msg: ChatResponseChoice["message"] =
+      choice.message ?? ({ role: "assistant" } as ChatResponseChoice["message"])
 
     const providerSpecificFields = this._extractProviderFields(msg)
     const providerMetadata = this._buildProviderMetadata(providerSpecificFields)
@@ -637,6 +709,11 @@ export class NemoGymLanguageModel implements LanguageModelV3 {
 
           const choice = responseJson.choices[0]
           if (!choice) throw new Error("nemo-gym: empty choices in response")
+          if (isGymContextOverflowCompletion(choice)) {
+            throw new ContextOverflowResponseError(
+              contextOverflowStreamError("NeMo Gym returned an empty length completion for an overlong context"),
+            )
+          }
           const msg: ChatResponseChoice["message"] =
             choice.message ?? ({ role: "assistant" } as ChatResponseChoice["message"])
 
@@ -697,7 +774,10 @@ export class NemoGymLanguageModel implements LanguageModelV3 {
   // Helpers
   // -----------------------------------------------------------------------
 
-  private async _buildRequestParams(options: LanguageModelV3CallOptions, session: SessionHeaders): Promise<{
+  private async _buildRequestParams(
+    options: LanguageModelV3CallOptions,
+    session: SessionHeaders,
+  ): Promise<{
     warnings: SharedV3Warning[]
     messages: ChatRequestMessage[]
     loggedMessages: ChatRequestMessage[]
@@ -897,6 +977,8 @@ export class NemoGymLanguageModel implements LanguageModelV3 {
         if (timer) clearTimeout(timer)
         if (!res.ok) {
           const text = await res.text().catch(() => "")
+          const contextOverflow = normalizeContextOverflowResponse(res.status, text)
+          if (contextOverflow) throw new ContextOverflowResponseError(contextOverflow)
           throw new Error(`NeMoGym ${url} ${res.status}: ${text.slice(0, 500)}`)
         }
         const setCookie = res.headers.get("set-cookie")
@@ -911,6 +993,7 @@ export class NemoGymLanguageModel implements LanguageModelV3 {
         return { responseJson }
       } catch (err) {
         if (timer) clearTimeout(timer)
+        if (err instanceof ContextOverflowResponseError) throw err
         lastErr = err
         if (attempt === retries - 1) break
         // Cap exponential backoff at 60s so unlimited-retries configs don't blow up the delay.
@@ -945,7 +1028,10 @@ export class NemoGymLanguageModel implements LanguageModelV3 {
     return md
   }
 
-  private _mapFinishReason(raw: string | null): { unified: "stop" | "length" | "tool-calls" | "error" | "other"; raw: string | undefined } {
+  private _mapFinishReason(raw: string | null): {
+    unified: "stop" | "length" | "tool-calls" | "error" | "other"
+    raw: string | undefined
+  } {
     if (!raw) return { unified: "other", raw: undefined }
     switch (raw) {
       case "stop":
@@ -987,10 +1073,9 @@ export class NemoGymLanguageModel implements LanguageModelV3 {
   }) {
     const turn = this._nextTurn(args.session.sessionID)
     const replay = this._replayState(args.session)
-    const recordedParentSessionID = replay?.recordedParentSessionID ??
-      (args.session.parentSessionID
-        ? this.liveToRecordedSession.get(args.session.parentSessionID)
-        : undefined)
+    const recordedParentSessionID =
+      replay?.recordedParentSessionID ??
+      (args.session.parentSessionID ? this.liveToRecordedSession.get(args.session.parentSessionID) : undefined)
     if (this.cfg.onCompletion) {
       try {
         await this.cfg.onCompletion({ turn, ...args })
