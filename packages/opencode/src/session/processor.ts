@@ -502,6 +502,7 @@ export const layer: Layer.Layer<
                 messageID: ctx.assistantMessage.parentID,
               })
               .pipe(Effect.ignore, Effect.forkIn(scope))
+            console.log(`[mercor][compaction] processor-check tokens=${JSON.stringify(usage.tokens)} -> needsCompaction=${isOverflow({ cfg: yield* config.get(), tokens: usage.tokens, model: ctx.model })}`)
             if (
               !ctx.assistantMessage.summary &&
               isOverflow({ cfg: yield* config.get(), tokens: usage.tokens, model: ctx.model })
