@@ -31,6 +31,7 @@ import {
   updateNemoGymMetrics,
   type ActionExecutionLatencyMetric,
 } from "./metrics"
+import * as BenchTerminalError from "./terminal_error"
 // opencode's built-in anthropic system prompt — Bun bundles .txt as a string.
 // Used as the default when no --system-prompt override is passed.
 import PROMPT_ANTHROPIC from "../session/prompt/anthropic.txt"
@@ -163,9 +164,7 @@ async function buildConfigDir(args: {
   const tmpRoot = await fs.mkdtemp(path.join(os.tmpdir(), `bench-${args.instanceId}-`))
   await fs.mkdir(tmpRoot, { recursive: true })
 
-  const systemPrompt = args.systemPromptPath
-    ? await fs.readFile(args.systemPromptPath, "utf8")
-    : DEFAULT_SYSTEM_PROMPT
+  const systemPrompt = args.systemPromptPath ? await fs.readFile(args.systemPromptPath, "utf8") : DEFAULT_SYSTEM_PROMPT
 
   const cfg: Record<string, unknown> = {
     $schema: "https://opencode.ai/config.json",
@@ -211,102 +210,102 @@ async function buildConfigDir(args: {
           edit: { "**": "allow" },
           bash: {
             "*": "allow",
-        
+
             // process termination
-            "killall*": "deny",
-            "pkill*": "deny",
-            "kill -1*": "deny",
-            "kill 0*": "deny",
-        
+            "*killall*": "deny",
+            "*pkill*": "deny",
+            "*kill -1*": "deny",
+            "*kill 0*": "deny",
+
             // filesystem destruction
-            "rm -rf /": "deny",
-            "rm -rf /*": "deny",
-            "rm -rf /bin*": "deny",
-            "rm -rf /usr*": "deny",
-            "rm -rf /etc*": "deny",
-            "rm -rf /var*": "deny",
-            "rm -rf /home*": "deny",
-            "rm -rf /root*": "deny",
-            "rm -rf /opt*": "deny",
-            "rm -rf /lib*": "deny",
-            "rm -rf /lib64*": "deny",
-            "rm -rf /sbin*": "deny",
-            "rm -rf /boot*": "deny",
-            "rm -rf /dev*": "deny",
-            "rm -rf /proc*": "deny",
-            "rm -rf /sys*": "deny",
-        
+            "*rm -rf /": "deny",
+            "*rm -rf /*": "deny",
+            "*rm -rf /bin*": "deny",
+            "*rm -rf /usr*": "deny",
+            "*rm -rf /etc*": "deny",
+            "*rm -rf /var*": "deny",
+            "*rm -rf /home*": "deny",
+            "*rm -rf /root*": "deny",
+            "*rm -rf /opt*": "deny",
+            "*rm -rf /lib*": "deny",
+            "*rm -rf /lib64*": "deny",
+            "*rm -rf /sbin*": "deny",
+            "*rm -rf /boot*": "deny",
+            "*rm -rf /dev*": "deny",
+            "*rm -rf /proc*": "deny",
+            "*rm -rf /sys*": "deny",
+
             // system control
-            "shutdown*": "deny",
-            "reboot*": "deny",
-            "poweroff*": "deny",
-            "halt*": "deny",
-            "init 0*": "deny",
-            "init 6*": "deny",
-        
+            // "*shutdown*": "deny",
+            // "*reboot*": "deny",
+            // "*poweroff*": "deny",
+            // "*halt*": "deny",
+            // "init 0*": "deny",
+            // "init 6*": "deny",
+
             // disk devices
             "dd *of=/dev/sd*": "deny",
             "dd *of=/dev/nvme*": "deny",
             "dd *of=/dev/hd*": "deny",
             "dd *of=/dev/null*": "deny",
-        
+
             // git network
-            "git fetch*": "deny",
-            "git pull*": "deny",
-            "git clone*": "deny",
-            "git ls-remote*": "deny",
-            "git remote add*": "deny",
-            "git remote set-url*": "deny",
-            "git remote set-head*": "deny",
-            "git remote update*": "deny",
-            "git remote rename*": "deny",
-            "git remote set-branches*": "deny",
-            "git submodule add*": "deny",
-            "git submodule update*": "deny",
-            "git submodule sync*": "deny",
-            "git submodule init*": "deny",
-            "git archive*--remote*": "deny",
-            "git *://*": "deny",
-            "git *@*:*": "deny",
-        
+            "*git fetch*": "deny",
+            "*git pull*": "deny",
+            "*git clone*": "deny",
+            "*git ls-remote*": "deny",
+            "*git remote add*": "deny",
+            "*git remote set-url*": "deny",
+            "*git remote set-head*": "deny",
+            "*git remote update*": "deny",
+            "*git remote rename*": "deny",
+            "*git remote set-branches*": "deny",
+            "*git submodule add*": "deny",
+            "*git submodule update*": "deny",
+            "*git submodule sync*": "deny",
+            "*git submodule init*": "deny",
+            "*git archive*--remote*": "deny",
+            "*git *://*": "deny",
+            "*git *@*:*": "deny",
+
             // git history mining
-            "git log*--all*": "deny",
-            "git log*--branches*": "deny",
-            "git log*--remotes*": "deny",
-            "git log*--walk-reflogs*": "deny",
-            "git log*--grep*": "deny",
-            "git rev-list*--all*": "deny",
-            "git rev-list*--branches*": "deny",
-            "git rev-list*--remotes*": "deny",
-            "git rev-list*--grep*": "deny",
-            "git shortlog*--all*": "deny",
-            "git reflog*": "deny",
-            "git cat-file*": "deny",
-            "git fsck*": "deny",
-            "git verify-pack*": "deny",
-            "git unpack-objects*": "deny",
-            "git cherry*": "deny",
-            "git show*": "deny",
-            "git merge-base*--is-ancestor*": "deny",
-            "git branch*--contains*": "deny",
-            "git tag*--contains*": "deny",
-            "git for-each-ref*--contains*": "deny",
-        
+            "*git log*--all*": "deny",
+            "*git log*--branches*": "deny",
+            "*git log*--remotes*": "deny",
+            "*git log*--walk-reflogs*": "deny",
+            "*git log*--grep*": "deny",
+            "*git rev-list*--all*": "deny",
+            "*git rev-list*--branches*": "deny",
+            "*git rev-list*--remotes*": "deny",
+            "*git rev-list*--grep*": "deny",
+            "*git shortlog*--all*": "deny",
+            "*git reflog*": "deny",
+            "*git cat-file*": "deny",
+            "*git fsck*": "deny",
+            "*git verify-pack*": "deny",
+            "*git unpack-objects*": "deny",
+            "*git cherry*": "deny",
+            "*git show*": "deny",
+            "*git merge-base*--is-ancestor*": "deny",
+            "*git branch*--contains*": "deny",
+            "*git tag*--contains*": "deny",
+            "*git for-each-ref*--contains*": "deny",
+
             // git internals (substring match on path)
             "*.git/logs*": "deny",
             "*.git/packed-refs*": "deny",
             "*.git/ORIG_HEAD*": "deny",
             "*.git/FETCH_HEAD*": "deny",
             "*.git/refs*": "deny",
-        
+
             // online lookups
-            "curl *github.com*": "deny",
-            "wget *github.com*": "deny",
-            "curl *githubusercontent.com*": "deny",
-            "wget *githubusercontent.com*": "deny",
-            "curl *github.io*": "deny",
-            "wget *github.io*": "deny"
-          }
+            "*curl *github.com*": "deny",
+            "*wget *github.com*": "deny",
+            "*curl *githubusercontent.com*": "deny",
+            "*wget *githubusercontent.com*": "deny",
+            "*curl *github.io*": "deny",
+            "*wget *github.io*": "deny",
+          },
         },
         tools: {
           bash: true,
@@ -358,6 +357,7 @@ function runOpencode(args: {
   stdout: string
   stderr: string
   actionExecutionLatencies: ActionExecutionLatencyMetric[]
+  terminalError?: BenchTerminalError.Kind
 }> {
   // Use the same bun binary that's currently running — guaranteed to exist
   // and avoids PATH lookup quirks under Bun's posix_spawn.
@@ -379,7 +379,6 @@ function runOpencode(args: {
         `nemo-gym/${args.modelName}`,
         "--format",
         "json",
-        "--dangerously-skip-permissions",
         "--dir",
         args.workspaceRoot,
       ],
@@ -390,6 +389,13 @@ function runOpencode(args: {
     )
     let stdout = ""
     let stderr = ""
+    let terminalError: BenchTerminalError.Kind | undefined
+    let terminalSignalBuffer = ""
+    const observeTerminalSignal = (chunk: string) => {
+      // Retain enough overlap to recognize a marker split across pipe chunks.
+      terminalSignalBuffer = (terminalSignalBuffer + chunk).slice(-256)
+      terminalError = BenchTerminalError.prefer(terminalError, BenchTerminalError.detect(terminalSignalBuffer))
+    }
     // Strip bulky token-ID metadata from echoed event lines. The IDs already
     // live in the llm_completions dumps; leaving them in the event stream
     // makes each turn re-echo that turn's full-context prompt_token_ids ->
@@ -414,7 +420,9 @@ function runOpencode(args: {
     let lineBuf = ""
     const actionExecutionLatencies = new Map<string, ActionExecutionLatencyMetric>()
     child.stdout?.on("data", (b) => {
-      lineBuf += b.toString("utf8")
+      const chunk = b.toString("utf8")
+      observeTerminalSignal(chunk)
+      lineBuf += chunk
       let idx: number
       while ((idx = lineBuf.indexOf("\n")) >= 0) {
         const rawLine = lineBuf.slice(0, idx)
@@ -432,14 +440,17 @@ function runOpencode(args: {
     })
     child.stderr?.on("data", (b) => {
       const chunk = b.toString("utf8")
+      observeTerminalSignal(chunk)
       stderr = (stderr + chunk).slice(-MAX_KEEP)
       process.stderr.write(chunk)
     })
     const metrics = () => [...actionExecutionLatencies.values()].sort((a, b) => a.timestamp.localeCompare(b.timestamp))
-    child.on("close", (code) => resolve({ exitCode: code ?? 0, stdout, stderr, actionExecutionLatencies: metrics() }))
+    child.on("close", (code) =>
+      resolve({ exitCode: code ?? 0, stdout, stderr, actionExecutionLatencies: metrics(), terminalError }),
+    )
     child.on("error", (err) => {
       stderr += String(err)
-      resolve({ exitCode: 999, stdout, stderr, actionExecutionLatencies: metrics() })
+      resolve({ exitCode: 999, stdout, stderr, actionExecutionLatencies: metrics(), terminalError })
     })
   })
 }
@@ -548,12 +559,19 @@ async function main() {
     OPENCODE_DB: ":memory:",
     OPENCODE_DATA: path.join(tmpRoot, "data"),
     OPENCODE_CONFIG: configFile,
+    // The benchmark already runs inside a SIF sandbox, so make that the
+    // security boundary. This final config override applies to subagents too.
+    OPENCODE_PERMISSION: JSON.stringify({ "*": "allow" }),
+
     // Disable opencode's built-in plugin loaders; the bench harness doesn't need them.
     OPENCODE_PURE: "1",
     // Skip the dynamic env block (working dir + Today's date) in the system
     // prompt — keeps the RL prompt-token prefix invariant stable across turns
     // (a midnight rollover would otherwise shift `Today's date: ...`).
     OPENCODE_DISABLE_ENV_PROMPT: "1",
+    // Have all agent sessions report terminal states to this bench wrapper.
+    // This is bench-only and does not alter normal opencode runs.
+    [BenchTerminalError.ENV]: "1",
   }
 
   // Bootstrap a git repo if the SIF shipped a flat source tree (swe-bench-ext
@@ -594,7 +612,7 @@ async function main() {
     initialize_runtime_time: initializeRuntimeTime,
   })
 
-  const error: string | null = result.exitCode === 0 ? null : `opencode_exit_${result.exitCode}`
+  const error = BenchTerminalError.toGymError(result.exitCode, result.terminalError)
   const outPath = await writeOutputJsonl(args.outputDir, instance.instance_id, {
     instance_id: instance.instance_id,
     test_result: { git_patch: patch },
@@ -615,7 +633,7 @@ async function main() {
   // child-stdio pipes from the opencode subprocess). Gym's runner treats any
   // non-zero apptainer exit as `Agent command failed` and discards the
   // already-written patch, so we MUST exit 0 deterministically on success.
-  process.exit(result.exitCode === 0 ? 0 : 1)
+  process.exit(BenchTerminalError.shouldExitSuccessfully(result.exitCode, result.terminalError) ? 0 : 1)
 }
 
 main().catch((err) => {
