@@ -238,9 +238,32 @@ async function buildConfigDir(args: {
       }
     }
   } else if (exaMode) {
-    console.log(
-      `[bench] search mode: EXA enabled (native websearch -> mcp.exa.ai, key ${(process.env["EXA_API_KEY"] ?? "").slice(0, 9)}****); tavily MCP bypassed`,
-    )
+    // Rotate the Exa key PER INSTANCE, same stable hash over instance_id that
+    // tavily uses above, so both providers spread load identically. Previously
+    // the runner pinned one key per SHARD, which meant shard count > pool size
+    // put two shards on one key (20 shards over 15 keys doubled keys 0-4 at any
+    // offset). Hashing per instance decouples shard count from key count, so the
+    // fleet can be sized for nodes rather than for the key pool.
+    // mcp-exa.ts reads EXA_API_KEY lazily, so assigning it here takes effect.
+    // Accept ':' or ',' — the runner joins with ':' because apptainer's --env
+    // splits on ',', but tolerate either so a hand-set pool also works.
+    const exaPool = (process.env["EXA_API_KEYS"] ?? "")
+      .split(/[:,]/)
+      .map((s) => s.trim())
+      .filter(Boolean)
+    if (exaPool.length > 0) {
+      let h = 0
+      for (const ch of args.instanceId) h = (h * 31 + ch.charCodeAt(0)) >>> 0
+      const idx = h % exaPool.length
+      process.env["EXA_API_KEY"] = exaPool[idx]
+      console.log(
+        `[bench] search mode: EXA enabled (native websearch -> mcp.exa.ai, per-instance key index ${idx} of ${exaPool.length}, ${exaPool[idx]!.slice(0, 9)}****); tavily MCP bypassed`,
+      )
+    } else {
+      console.log(
+        `[bench] search mode: EXA enabled (native websearch -> mcp.exa.ai, single key ${(process.env["EXA_API_KEY"] ?? "").slice(0, 9)}****, no EXA_API_KEYS pool); tavily MCP bypassed`,
+      )
+    }
   } else if (searchMode) {
     console.log(`[bench] search mode requested but MCP assets missing (${mcpEntry}); web tools unavailable`)
   }

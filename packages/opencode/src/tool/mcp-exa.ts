@@ -1,9 +1,15 @@
 import { Duration, Effect, Schema } from "effect"
 import { HttpClient, HttpClientRequest } from "effect/unstable/http"
 
-const URL = process.env.EXA_API_KEY
-  ? `https://mcp.exa.ai/mcp?exaApiKey=${encodeURIComponent(process.env.EXA_API_KEY)}`
-  : "https://mcp.exa.ai/mcp"
+// Read EXA_API_KEY LAZILY, not at module load. bench/cli.ts picks a per-instance
+// key out of the EXA_API_KEYS pool (stable hash over instance_id, mirroring the
+// tavily rotation) and assigns process.env.EXA_API_KEY while starting the run --
+// which lands AFTER this module is imported. A module-scope const would capture
+// the pre-rotation value and silently pin every instance to one key.
+const url = () =>
+  process.env.EXA_API_KEY
+    ? `https://mcp.exa.ai/mcp?exaApiKey=${encodeURIComponent(process.env.EXA_API_KEY)}`
+    : "https://mcp.exa.ai/mcp"
 
 const McpResult = Schema.Struct({
   result: Schema.Struct({
@@ -54,7 +60,7 @@ export const call = <F extends Schema.Struct.Fields>(
   timeout: Duration.Input,
 ) =>
   Effect.gen(function* () {
-    const request = yield* HttpClientRequest.post(URL).pipe(
+    const request = yield* HttpClientRequest.post(url()).pipe(
       HttpClientRequest.accept("application/json, text/event-stream"),
       HttpClientRequest.schemaBodyJson(McpRequest(args))({
         jsonrpc: "2.0" as const,
