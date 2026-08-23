@@ -61,6 +61,7 @@ import * as DateTime from "effect/DateTime"
 import { eq } from "@/storage/db"
 import * as Database from "@/storage/db"
 import { SessionTable } from "./session.sql"
+import * as BenchTerminalError from "@/bench/terminal_error"
 
 // @ts-ignore
 globalThis.AI_SDK_LOG_WARNINGS = false
@@ -87,7 +88,7 @@ export interface Interface {
   readonly resolvePromptParts: (template: string) => Effect.Effect<PromptInput["parts"]>
 }
 
-export class Service extends Context.Service<Service, Interface>()("@opencode/SessionPrompt") {}
+export class Service extends Context.Service<Service, Interface>()("@opencode/SessionPrompt") { }
 
 export const layer = Layer.effect(
   Service,
@@ -1315,10 +1316,10 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                 name: part.filename,
                 source: part.source
                   ? new Source({
-                      start: part.source.text.start,
-                      end: part.source.text.end,
-                      text: part.source.text.value,
-                    })
+                    start: part.source.text.start,
+                    end: part.source.text.end,
+                    text: part.source.text.value,
+                  })
                   : undefined,
               }),
             )
@@ -1329,10 +1330,10 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                 name: part.name,
                 source: part.source
                   ? new Source({
-                      start: part.source.start,
-                      end: part.source.end,
-                      text: part.source.value,
-                    })
+                    start: part.source.start,
+                    end: part.source.end,
+                    text: part.source.value,
+                  })
                   : undefined,
               }),
             )
@@ -1507,6 +1508,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
           }
           const maxSteps = agent.steps ?? Infinity
           const isLastStep = stepsSinceCompaction >= maxSteps
+          if (isLastStep) BenchTerminalError.report("max_iteration")
           msgs = yield* insertReminders({ messages: msgs, agent, session })
 
           const msg: MessageV2.Assistant = {
@@ -1732,15 +1734,15 @@ NOTE: At any point in time through this workflow you should feel free to ask the
       const isSubtask = (agent.mode === "subagent" && cmd.subtask !== false) || cmd.subtask === true
       const parts = isSubtask
         ? [
-            {
-              type: "subtask" as const,
-              agent: agent.name,
-              description: cmd.description ?? "",
-              command: input.command,
-              model: { providerID: taskModel.providerID, modelID: taskModel.modelID },
-              prompt: templateParts.find((y) => y.type === "text")?.text ?? "",
-            },
-          ]
+          {
+            type: "subtask" as const,
+            agent: agent.name,
+            description: cmd.description ?? "",
+            command: input.command,
+            model: { providerID: taskModel.providerID, modelID: taskModel.modelID },
+            prompt: templateParts.find((y) => y.type === "text")?.text ?? "",
+          },
+        ]
         : [...templateParts, ...(input.parts ?? [])]
 
       const userAgent = isSubtask ? (input.agent ?? (yield* agents.defaultAgent())) : agentName
