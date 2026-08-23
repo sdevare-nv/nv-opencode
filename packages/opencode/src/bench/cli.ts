@@ -205,11 +205,17 @@ async function buildConfigDir(args: {
   // setup_scripts/opencode.sh and mounted read-only at /opencode_setup/mcp;
   // API keys rotate per-instance via a stable hash over instance_id.
   const searchMode = (args.dataset ?? "").startsWith("search/")
+  // SEARCH_PROVIDER=exa swaps the tavily MCP for opencode's native websearch
+  // (exa-backed). Forwarded into the sandbox by Gym's explicit --env list; the
+  // launcher also sets DISABLE_TAVILY_MCP=1 so the MCP dir is never mounted, which
+  // makes the two providers mutually exclusive at BOTH ends rather than relying on
+  // this flag alone.
+  const exaMode = searchMode && (process.env["SEARCH_PROVIDER"] ?? "").toLowerCase() === "exa"
   const mcpEntry = "/opencode_setup/mcp/node_modules/tavily-mcp/build/index.js"
   const keysFile = "/opencode_setup/mcp/tavily_keys.txt"
   let tavilyKey: string | undefined
   let tavilyDefaults: string | undefined
-  if (searchMode && existsSync(mcpEntry) && existsSync(keysFile)) {
+  if (searchMode && !exaMode && existsSync(mcpEntry) && existsSync(keysFile)) {
     const keys = (await fs.readFile(keysFile, "utf8"))
       .split("\n")
       // the key cache stores JSON-style quoted strings ("tvly-prod-...") —
@@ -231,6 +237,10 @@ async function buildConfigDir(args: {
         console.log(`[bench] WARNING: ${defaultsFile} missing — tavily runs with library defaults`)
       }
     }
+  } else if (exaMode) {
+    console.log(
+      `[bench] search mode: EXA enabled (native websearch -> mcp.exa.ai, key ${(process.env["EXA_API_KEY"] ?? "").slice(0, 9)}****); tavily MCP bypassed`,
+    )
   } else if (searchMode) {
     console.log(`[bench] search mode requested but MCP assets missing (${mcpEntry}); web tools unavailable`)
   }
@@ -397,11 +407,21 @@ async function buildConfigDir(args: {
           grep: true,
           write: true,
           apply_patch: true,
-          // search/*: web access comes exclusively from the tavily MCP tools
-          // (web_tavily_search/extract), strict harbor parity. Native webfetch
-          // (direct HTTP) and websearch (exa-backed) both stay off.
-          webfetch: false,
-          websearch: false,
+          // search/*: web access comes from ONE provider, never both, so a run can
+          // never silently mix search backends.
+          //   SEARCH_PROVIDER unset|tavily -> tavily MCP only (web_search/web_extract),
+          //                                   strict harbor parity; native web off.
+          //   SEARCH_PROVIDER=exa          -> native websearch (exa-backed, routed to
+          //                                   mcp.exa.ai by websearch.ts) + webfetch;
+          //                                   the tavily MCP mount is skipped upstream
+          //                                   by Gym (DISABLE_TAVILY_MCP=1).
+          // NOTE: this per-session `tools` map overrides Registry's own gate
+          // (tool/registry.ts:287 `providerID === opencode || Flag.OPENCODE_ENABLE_EXA`).
+          // Leaving websearch hardcoded false made OPENCODE_ENABLE_EXA a silent no-op:
+          // the model would call `search`, get "unavailable tool", and fall back to
+          // bash/curl while the run still looked healthy.
+          webfetch: exaMode,
+          websearch: exaMode,
           task: args.enableSubagents,
           skill: false,
           todowrite: true,
@@ -433,6 +453,13 @@ async function buildConfigDir(args: {
               environment: {
                 TAVILY_API_KEY: tavilyKey,
                 ...(tavilyDefaults ? { DEFAULT_PARAMETERS: tavilyDefaults } : {}),
+                // Node-local search-cache sidecar. Set by the gym only when
+                // search_cache_dir is configured; the patched tavily-mcp checks
+                // it before every search/extract and goes straight to the live
+                // API when unset. apptainer runs without --net, so the
+                // container shares the host network namespace and 127.0.0.1
+                // reaches the sidecar on this node.
+                ...(process.env.TAVILY_CACHE_URL ? { TAVILY_CACHE_URL: process.env.TAVILY_CACHE_URL } : {}),
               },
             },
           },
