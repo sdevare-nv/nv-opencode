@@ -411,6 +411,8 @@ export const RunCommand = effectCmd({
       }
 
       async function execute(sdk: OpencodeClient) {
+        const benchEventTypesOnly = process.env.OPENCODE_BENCH_EVENT_TYPES_ONLY === "1"
+
         function tool(part: ToolPart) {
           try {
             if (part.tool === ShellID.ToolID) return shell(props<typeof ShellTool>(part))
@@ -432,6 +434,10 @@ export const RunCommand = effectCmd({
 
         function emit(type: string, data: Record<string, unknown>) {
           if (args.format === "json") {
+            if (benchEventTypesOnly && type !== "tool_use") {
+              process.stdout.write(type + EOL)
+              return true
+            }
             process.stdout.write(JSON.stringify({ type, timestamp: Date.now(), sessionID, ...data }) + EOL)
             return true
           }

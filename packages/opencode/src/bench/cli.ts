@@ -12,7 +12,7 @@
  * A subprocess gives us:
  *   - clean process isolation per instance (matters for many parallel SIFs)
  *   - identical bootstrapping path to `opencode run`, so we don't drift
- *   - the JSON event stream on stdout for free (--format json)
+ *   - a compact event-type stream on stdout
  *
  * Trajectory capture: the nemo-gym provider (registered via this config)
  * writes `<completionsDir>/<turn>.json` per LLM call BEFORE returning. On
@@ -396,26 +396,6 @@ function runOpencode(args: {
       terminalSignalBuffer = (terminalSignalBuffer + chunk).slice(-256)
       terminalError = BenchTerminalError.prefer(terminalError, BenchTerminalError.detect(terminalSignalBuffer))
     }
-    // Strip bulky token-ID metadata from echoed event lines. The IDs already
-    // live in the llm_completions dumps; leaving them in the event stream
-    // makes each turn re-echo that turn's full-context prompt_token_ids ->
-    // O(n^2) log growth (observed: 22GB driver logs, multi-MB agent logs
-    // within minutes at 1024-way training concurrency).
-    const TOKEN_FIELDS = ["prompt_token_ids", "generation_token_ids", "generation_log_probs"]
-    const scrub = (line: string): string => {
-      if (!(line.includes('"nemo-gym"') && line.includes('"prompt_token_ids"'))) return line
-      try {
-        const evt = JSON.parse(line)
-        const md = evt?.part?.metadata?.["nemo-gym"]
-        if (md) {
-          for (const k of TOKEN_FIELDS) {
-            if (Array.isArray(md[k])) md[k] = `<${md[k].length} stripped>`
-          }
-          return JSON.stringify(evt)
-        }
-      } catch {}
-      return line
-    }
     const MAX_KEEP = 256 * 1024 // keep only a bounded tail for error reporting
     let lineBuf = ""
     const actionExecutionLatencies = new Map<string, ActionExecutionLatencyMetric>()
@@ -432,8 +412,9 @@ function runOpencode(args: {
           const metricID = `${actionMetric.session_id}:${actionMetric.observation_id}`
           actionExecutionLatencies.set(metricID, actionMetric)
         }
-        const line = scrub(rawLine)
-        // Forward to our stdout so the gym log captures the event stream.
+        // Keep full tool details in metrics, but expose only the event type to
+        // the outer Gym log so large inputs and outputs are not duplicated.
+        const line = actionMetric ? "tool_use" : rawLine
         process.stdout.write(line + "\n")
         stdout = (stdout + line + "\n").slice(-MAX_KEEP)
       }
@@ -572,6 +553,8 @@ async function main() {
     // Have all agent sessions report terminal states to this bench wrapper.
     // This is bench-only and does not alter normal opencode runs.
     [BenchTerminalError.ENV]: "1",
+    // Avoid serializing and piping full event payloads into the gym log.
+    OPENCODE_BENCH_EVENT_TYPES_ONLY: "1",
   }
 
   // Bootstrap a git repo if the SIF shipped a flat source tree (swe-bench-ext
