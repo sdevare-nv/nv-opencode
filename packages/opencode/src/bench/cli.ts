@@ -194,6 +194,9 @@ async function buildConfigDir(args: {
       },
     },
     agent: {
+      title: {
+        disable: true,
+      },
       "swe-bench": {
         mode: "primary",
         model: `nemo-gym/${args.modelName}`,
