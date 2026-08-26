@@ -12,7 +12,7 @@
  * A subprocess gives us:
  *   - clean process isolation per instance (matters for many parallel SIFs)
  *   - identical bootstrapping path to `opencode run`, so we don't drift
- *   - the JSON event stream on stdout for free (--format json)
+ *   - a compact event-type stream on stdout
  *
  * Trajectory capture: the nemo-gym provider (registered via this config)
  * writes `<completionsDir>/<turn>.json` per LLM call BEFORE returning. On
@@ -27,6 +27,7 @@ import { spawn } from "node:child_process"
 import { runDeepReset } from "./deep_reset"
 import { bootstrapRepoIfMissing } from "./bootstrap_repo"
 import { capturePatch, ensureCommitIdentity, parsePatchMode, recordBaselineCommit, type PatchMode } from "./patch"
+import * as BenchTerminalError from "./terminal_error"
 // opencode's built-in anthropic system prompt — Bun bundles .txt as a string.
 // Used as the default when no --system-prompt override is passed.
 import PROMPT_ANTHROPIC from "../session/prompt/anthropic.txt"
@@ -165,9 +166,7 @@ async function buildConfigDir(args: {
   const tmpRoot = await fs.mkdtemp(path.join(os.tmpdir(), `bench-${args.instanceId}-`))
   await fs.mkdir(tmpRoot, { recursive: true })
 
-  const systemPrompt = args.systemPromptPath
-    ? await fs.readFile(args.systemPromptPath, "utf8")
-    : DEFAULT_SYSTEM_PROMPT
+  const systemPrompt = args.systemPromptPath ? await fs.readFile(args.systemPromptPath, "utf8") : DEFAULT_SYSTEM_PROMPT
 
   const cfg: Record<string, unknown> = {
     $schema: "https://opencode.ai/config.json",
@@ -203,6 +202,9 @@ async function buildConfigDir(args: {
       },
     },
     agent: {
+      title: {
+        disable: true,
+      },
       "swe-bench": {
         mode: "primary",
         model: `nemo-gym/${args.modelName}`,
@@ -213,13 +215,13 @@ async function buildConfigDir(args: {
           edit: { "**": "allow" },
           bash: {
             "*": "allow",
-        
+
             // process termination
             "*killall*": "deny",
             "*pkill*": "deny",
             "*kill -1*": "deny",
             "*kill 0*": "deny",
-        
+
             // filesystem destruction
             "*rm -rf /": "deny",
             "*rm -rf /*": "deny",
@@ -237,7 +239,7 @@ async function buildConfigDir(args: {
             "*rm -rf /dev*": "deny",
             "*rm -rf /proc*": "deny",
             "*rm -rf /sys*": "deny",
-        
+
             // system control
             // "*shutdown*": "deny",
             // "*reboot*": "deny",
@@ -245,13 +247,13 @@ async function buildConfigDir(args: {
             // "*halt*": "deny",
             // "init 0*": "deny",
             // "init 6*": "deny",
-        
+
             // disk devices
             "dd *of=/dev/sd*": "deny",
             "dd *of=/dev/nvme*": "deny",
             "dd *of=/dev/hd*": "deny",
             "dd *of=/dev/null*": "deny",
-        
+
             // git network
             "*git fetch*": "deny",
             "*git pull*": "deny",
@@ -270,7 +272,7 @@ async function buildConfigDir(args: {
             "*git archive*--remote*": "deny",
             "*git *://*": "deny",
             "*git *@*:*": "deny",
-        
+
             // git history mining
             "*git log*--all*": "deny",
             "*git log*--branches*": "deny",
@@ -293,22 +295,22 @@ async function buildConfigDir(args: {
             "*git branch*--contains*": "deny",
             "*git tag*--contains*": "deny",
             "*git for-each-ref*--contains*": "deny",
-        
+
             // git internals (substring match on path)
             "*.git/logs*": "deny",
             "*.git/packed-refs*": "deny",
             "*.git/ORIG_HEAD*": "deny",
             "*.git/FETCH_HEAD*": "deny",
             "*.git/refs*": "deny",
-        
+
             // online lookups
             "*curl *github.com*": "deny",
             "*wget *github.com*": "deny",
             "*curl *githubusercontent.com*": "deny",
             "*wget *githubusercontent.com*": "deny",
             "*curl *github.io*": "deny",
-            "*wget *github.io*": "deny"
-          }
+            "*wget *github.io*": "deny",
+          },
         },
         tools: {
           bash: true,
@@ -345,7 +347,7 @@ function runOpencode(args: {
   env: NodeJS.ProcessEnv
   opencodeBin: string
   agent: string
-}): Promise<{ exitCode: number; stdout: string; stderr: string }> {
+}): Promise<{ exitCode: number; stdout: string; stderr: string; terminalError?: BenchTerminalError.Kind }> {
   // Use the same bun binary that's currently running — guaranteed to exist
   // and avoids PATH lookup quirks under Bun's posix_spawn.
   const bunPath = process.execPath
@@ -376,48 +378,38 @@ function runOpencode(args: {
     )
     let stdout = ""
     let stderr = ""
-    // Strip bulky token-ID metadata from echoed event lines. The IDs already
-    // live in the llm_completions dumps; leaving them in the event stream
-    // makes each turn re-echo that turn's full-context prompt_token_ids ->
-    // O(n^2) log growth (observed: 22GB driver logs, multi-MB agent logs
-    // within minutes at 1024-way training concurrency).
-    const TOKEN_FIELDS = ["prompt_token_ids", "generation_token_ids", "generation_log_probs"]
-    const scrub = (line: string): string => {
-      if (!(line.includes('"nemo-gym"') && line.includes('"prompt_token_ids"'))) return line
-      try {
-        const evt = JSON.parse(line)
-        const md = evt?.part?.metadata?.["nemo-gym"]
-        if (md) {
-          for (const k of TOKEN_FIELDS) {
-            if (Array.isArray(md[k])) md[k] = `<${md[k].length} stripped>`
-          }
-          return JSON.stringify(evt)
-        }
-      } catch {}
-      return line
+    let terminalError: BenchTerminalError.Kind | undefined
+    let terminalSignalBuffer = ""
+    const observeTerminalSignal = (chunk: string) => {
+      // Retain enough overlap to recognize a marker split across pipe chunks.
+      terminalSignalBuffer = (terminalSignalBuffer + chunk).slice(-256)
+      terminalError = BenchTerminalError.prefer(terminalError, BenchTerminalError.detect(terminalSignalBuffer))
     }
     const MAX_KEEP = 256 * 1024 // keep only a bounded tail for error reporting
     let lineBuf = ""
     child.stdout?.on("data", (b) => {
-      lineBuf += b.toString("utf8")
+      const chunk = b.toString("utf8")
+      observeTerminalSignal(chunk)
+      lineBuf += chunk
       let idx: number
       while ((idx = lineBuf.indexOf("\n")) >= 0) {
-        const line = scrub(lineBuf.slice(0, idx))
+        const line = lineBuf.slice(0, idx)
         lineBuf = lineBuf.slice(idx + 1)
-        // Forward to our stdout so the gym log captures the event stream.
+        // Forward the event type so the gym log captures progress cheaply.
         process.stdout.write(line + "\n")
         stdout = (stdout + line + "\n").slice(-MAX_KEEP)
       }
     })
     child.stderr?.on("data", (b) => {
       const chunk = b.toString("utf8")
+      observeTerminalSignal(chunk)
       stderr = (stderr + chunk).slice(-MAX_KEEP)
       process.stderr.write(chunk)
     })
-    child.on("close", (code) => resolve({ exitCode: code ?? 0, stdout, stderr }))
+    child.on("close", (code) => resolve({ exitCode: code ?? 0, stdout, stderr, terminalError }))
     child.on("error", (err) => {
       stderr += String(err)
-      resolve({ exitCode: 999, stdout, stderr })
+      resolve({ exitCode: 999, stdout, stderr, terminalError })
     })
   })
 }
@@ -517,6 +509,11 @@ async function main() {
     // prompt — keeps the RL prompt-token prefix invariant stable across turns
     // (a midnight rollover would otherwise shift `Today's date: ...`).
     OPENCODE_DISABLE_ENV_PROMPT: "1",
+    // Have all agent sessions report terminal states to this bench wrapper.
+    // This is bench-only and does not alter normal opencode runs.
+    [BenchTerminalError.ENV]: "1",
+    // Avoid serializing and piping full event payloads into the gym log.
+    OPENCODE_BENCH_EVENT_TYPES_ONLY: "1",
   }
 
   // Bootstrap a git repo if the SIF shipped a flat source tree (swe-bench-ext
@@ -556,7 +553,7 @@ async function main() {
   const patch = await capturePatch(workspaceRoot, args.patchMode, baselineCommit)
   const benchRunTime = (Date.now() - startedAt) / 1000
 
-  const error: string | null = result.exitCode === 0 ? null : `opencode_exit_${result.exitCode}`
+  const error = BenchTerminalError.toGymError(result.exitCode, result.terminalError)
   const outPath = await writeOutputJsonl(args.outputDir, instance.instance_id, {
     instance_id: instance.instance_id,
     test_result: { git_patch: patch },
@@ -579,7 +576,7 @@ async function main() {
   // child-stdio pipes from the opencode subprocess). Gym's runner treats any
   // non-zero apptainer exit as `Agent command failed` and discards the
   // already-written patch, so we MUST exit 0 deterministically on success.
-  process.exit(result.exitCode === 0 ? 0 : 1)
+  process.exit(BenchTerminalError.shouldExitSuccessfully(result.exitCode, result.terminalError) ? 0 : 1)
 }
 
 main().catch((err) => {

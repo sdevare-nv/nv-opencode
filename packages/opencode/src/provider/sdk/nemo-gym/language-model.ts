@@ -85,6 +85,24 @@ interface ChatResponse {
   usage?: ChatResponseUsage
 }
 
+function contextOverflowStreamError(message: string): string {
+  return JSON.stringify({
+    type: "error",
+    error: {
+      code: "context_length_exceeded",
+      message: message.slice(0, 2_000) || "Input exceeds context window of this model",
+    },
+  })
+}
+
+function isGymContextOverflowCompletion(choice: ChatResponseChoice): boolean {
+  // Gym's vLLM wrapper translates an upstream context-overflow HTTP 400 into
+  // a successful empty completion. The stable signal it returns is exactly
+  // this pair. `content == null` alone is not enough because valid tool-call
+  // completions also normally carry null assistant content.
+  return choice.finish_reason === "length" && choice.message?.content == null
+}
+
 // ---------------------------------------------------------------------------
 // Config
 // ---------------------------------------------------------------------------
@@ -197,7 +215,13 @@ export class NemoGymLanguageModel implements LanguageModelV3 {
 
     const choice = responseJson.choices[0]
     if (!choice) throw new Error("nemo-gym: empty choices in response")
-    const msg: ChatResponseChoice["message"] = choice.message ?? ({ role: "assistant" } as ChatResponseChoice["message"])
+    if (isGymContextOverflowCompletion(choice)) {
+      throw new Error(
+        contextOverflowStreamError("NeMo Gym returned an empty length completion for an overlong context"),
+      )
+    }
+    const msg: ChatResponseChoice["message"] =
+      choice.message ?? ({ role: "assistant" } as ChatResponseChoice["message"])
 
     const providerSpecificFields = this._extractProviderFields(msg)
     const providerMetadata = this._buildProviderMetadata(providerSpecificFields)
@@ -253,6 +277,11 @@ export class NemoGymLanguageModel implements LanguageModelV3 {
 
           const choice = responseJson.choices[0]
           if (!choice) throw new Error("nemo-gym: empty choices in response")
+          if (isGymContextOverflowCompletion(choice)) {
+            throw new Error(
+              contextOverflowStreamError("NeMo Gym returned an empty length completion for an overlong context"),
+            )
+          }
           const msg: ChatResponseChoice["message"] =
             choice.message ?? ({ role: "assistant" } as ChatResponseChoice["message"])
 
@@ -575,7 +604,10 @@ export class NemoGymLanguageModel implements LanguageModelV3 {
     return md
   }
 
-  private _mapFinishReason(raw: string | null): { unified: "stop" | "length" | "tool-calls" | "error" | "other"; raw: string | undefined } {
+  private _mapFinishReason(raw: string | null): {
+    unified: "stop" | "length" | "tool-calls" | "error" | "other"
+    raw: string | undefined
+  } {
     if (!raw) return { unified: "other", raw: undefined }
     switch (raw) {
       case "stop":
