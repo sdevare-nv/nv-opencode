@@ -26,6 +26,11 @@
 #   COMMAND_EXEC_TIMEOUT            per-bash-command timeout in seconds
 #   DIVERSIFY_TOOL_NAMES            optional: rename tools for RL diversity
 #   CAMEL_CASE_TOOL_NAMES           optional: camelCase tool names
+#   PATCH_MODE                      optional: how the model patch is extracted.
+#                                   `worktree` (default) = `git diff` of the
+#                                   working tree; `committed` = diff of what the
+#                                   agent committed, for task families whose
+#                                   prompt asks the agent to commit its work.
 
 set -eo pipefail
 
@@ -96,6 +101,7 @@ echo "INSTANCE_DICT_PATH: $INSTANCE_DICT_PATH"
 echo "CONFIG_FILE: $CONFIG_FILE"
 echo "WORKSPACE_ROOT: $WORKSPACE_ROOT"
 echo "USER_MESSAGE_PATH: $USER_MESSAGE_PATH"
+echo "PATCH_MODE: ${PATCH_MODE:-worktree (default)}"
 echo "SYSTEM_PROMPT_PATH: $SYSTEM_PROMPT_PATH"
 echo "REPLAY_MESSAGES_PATH: $REPLAY_MESSAGES_PATH"
 echo "REPLAY_SUBAGENTS_PATH: $REPLAY_SUBAGENTS_PATH"
@@ -125,6 +131,10 @@ if [ -n "$REPLAY_SUBAGENTS_PATH" ]; then
 fi
 if [ "${ENABLE_SUBAGENTS:-0}" = "1" ] || [ "${ENABLE_SUBAGENTS:-}" = "true" ]; then
     cmd+=(--enable-subagents)
+fi
+# Omitted entirely when unset so cli.ts keeps its own default (`worktree`).
+if [ -n "${PATCH_MODE:-}" ]; then
+    cmd+=(--patch-mode "$PATCH_MODE")
 fi
 
 echo "Executing: ${cmd[*]}"

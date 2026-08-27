@@ -12,11 +12,12 @@
  * A subprocess gives us:
  *   - clean process isolation per instance (matters for many parallel SIFs)
  *   - identical bootstrapping path to `opencode run`, so we don't drift
- *   - the JSON event stream on stdout for free (--format json)
+ *   - a compact event-type stream on stdout
  *
  * Trajectory capture: the nemo-gym provider (registered via this config)
  * writes `<completionsDir>/<turn>.json` per LLM call BEFORE returning. On
- * exit we capture `git diff` and write `output.jsonl`.
+ * exit we capture the model patch (see ./patch.ts for the two modes) and write
+ * `output.jsonl`.
  */
 
 import { existsSync, promises as fs, readFileSync } from "node:fs"
@@ -25,6 +26,8 @@ import os from "node:os"
 import { spawn } from "node:child_process"
 import { runDeepReset } from "./deep_reset"
 import { bootstrapRepoIfMissing } from "./bootstrap_repo"
+import { capturePatch, ensureCommitIdentity, parsePatchMode, recordBaselineCommit, type PatchMode } from "./patch"
+import * as BenchTerminalError from "./terminal_error"
 // opencode's built-in anthropic system prompt — Bun bundles .txt as a string.
 // Used as the default when no --system-prompt override is passed.
 import PROMPT_ANTHROPIC from "../session/prompt/anthropic.txt"
@@ -55,6 +58,8 @@ interface CliArgs {
   replayMessagesFile?: string
   /** Causal parent-task-call -> recorded child-session replay graph. */
   replaySubagentsFile?: string
+  /** How the model patch is extracted at the end of the run. See ./patch.ts. */
+  patchMode: PatchMode
 }
 
 function parseArgs(argv: string[]): CliArgs {
@@ -64,6 +69,7 @@ function parseArgs(argv: string[]): CliArgs {
     dataset: "",
     split: "test",
     enableSubagents: false,
+    patchMode: parsePatchMode(undefined),
   }
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]
@@ -110,6 +116,9 @@ function parseArgs(argv: string[]): CliArgs {
         break
       case "--replay-subagents-file":
         out.replaySubagentsFile = next()
+        break
+      case "--patch-mode":
+        out.patchMode = parsePatchMode(next())
         break
       default:
         if (a.startsWith("--")) throw new Error(`Unknown flag: ${a}`)
@@ -218,6 +227,9 @@ async function buildConfigDir(args: {
       },
     },
     agent: {
+      title: {
+        disable: true,
+      },
       "swe-bench": {
         mode: "primary",
         model: `nemo-gym/${args.modelName}`,
@@ -353,16 +365,6 @@ async function buildConfigDir(args: {
   return { tmpRoot, configFile }
 }
 
-// Some SIFs ship with bare PATH lookups that ENOENT on bare program names
-// through Bun's posix_spawn. Resolve to an absolute path up front for any
-// binary we shell out to.
-function detectBin(candidates: string[]): string | null {
-  for (const p of candidates) {
-    if (existsSync(p)) return p
-  }
-  return null
-}
-
 function runOpencode(args: {
   workspaceRoot: string
   modelName: string
@@ -408,26 +410,6 @@ function runOpencode(args: {
       terminalSignalBuffer = (terminalSignalBuffer + chunk).slice(-256)
       terminalError = BenchTerminalError.prefer(terminalError, BenchTerminalError.detect(terminalSignalBuffer))
     }
-    // Strip bulky token-ID metadata from echoed event lines. The IDs already
-    // live in the llm_completions dumps; leaving them in the event stream
-    // makes each turn re-echo that turn's full-context prompt_token_ids ->
-    // O(n^2) log growth (observed: 22GB driver logs, multi-MB agent logs
-    // within minutes at 1024-way training concurrency).
-    const TOKEN_FIELDS = ["prompt_token_ids", "generation_token_ids", "generation_log_probs"]
-    const scrub = (line: string): string => {
-      if (!(line.includes('"nemo-gym"') && line.includes('"prompt_token_ids"'))) return line
-      try {
-        const evt = JSON.parse(line)
-        const md = evt?.part?.metadata?.["nemo-gym"]
-        if (md) {
-          for (const k of TOKEN_FIELDS) {
-            if (Array.isArray(md[k])) md[k] = `<${md[k].length} stripped>`
-          }
-          return JSON.stringify(evt)
-        }
-      } catch {}
-      return line
-    }
     const MAX_KEEP = 256 * 1024 // keep only a bounded tail for error reporting
     let lineBuf = ""
     child.stdout?.on("data", (b) => {
@@ -436,9 +418,9 @@ function runOpencode(args: {
       lineBuf += chunk
       let idx: number
       while ((idx = lineBuf.indexOf("\n")) >= 0) {
-        const line = scrub(lineBuf.slice(0, idx))
+        const line = lineBuf.slice(0, idx)
         lineBuf = lineBuf.slice(idx + 1)
-        // Forward to our stdout so the gym log captures the event stream.
+        // Forward the event type so the gym log captures progress cheaply.
         process.stdout.write(line + "\n")
         stdout = (stdout + line + "\n").slice(-MAX_KEEP)
       }
@@ -455,25 +437,6 @@ function runOpencode(args: {
       resolve({ exitCode: 999, stdout, stderr, terminalError })
     })
   })
-}
-
-async function captureGitDiff(workspaceRoot: string): Promise<string> {
-  const gitPath = detectBin(["/usr/bin/git", "/bin/git", "/usr/local/bin/git"]) ?? "git"
-  const runGit = (args: string[], capture: boolean): Promise<string> =>
-    new Promise((resolve) => {
-      const child = spawn(gitPath, ["-C", workspaceRoot, ...args], {
-        env: { ...process.env, GIT_PAGER: "cat" },
-      })
-      let stdout = ""
-      if (capture) child.stdout?.on("data", (b) => (stdout += b.toString("utf8")))
-      child.on("close", () => resolve(stdout))
-      child.on("error", () => resolve(""))
-    })
-  // Mark untracked files as intent-to-add so newly-created files appear in
-  // `git diff` without being committed. Plain `git diff` only shows changes
-  // to tracked files, which silently drops new-file patches the agent wrote.
-  await runGit(["add", "-AN"], false)
-  return runGit(["diff", "--binary"], true)
 }
 
 interface OutputJsonl {
@@ -597,10 +560,12 @@ async function main() {
     // Have all agent sessions report terminal states to this bench wrapper.
     // This is bench-only and does not alter normal opencode runs.
     [BenchTerminalError.ENV]: "1",
+    // Avoid serializing and piping full event payloads into the gym log.
+    OPENCODE_BENCH_EVENT_TYPES_ONLY: "1",
   }
 
   // Bootstrap a git repo if the SIF shipped a flat source tree (swe-bench-ext
-  // and some SWE-rebench variants). Without this, captureGitDiff returns ""
+  // and some SWE-rebench variants). Without this, the patch capture returns ""
   // and every patch is recorded as 0 bytes.
   const { freshInit } = await bootstrapRepoIfMissing(workspaceRoot)
 
@@ -613,6 +578,16 @@ async function main() {
     await runDeepReset(workspaceRoot, String(instance.base_commit ?? ""))
   }
 
+  // Snapshot the pristine HEAD *after* bootstrap/deep-reset — it is the diff
+  // base for `--patch-mode committed`. Recorded unconditionally so the log
+  // always shows what the agent started from.
+  const baselineCommit = await recordBaselineCommit(workspaceRoot)
+  console.log(`[bench] patch_mode=${args.patchMode} baseline=${baselineCommit || "<none>"}`)
+  if (args.patchMode === "committed") {
+    // The agent is expected to commit; make sure git will let it.
+    await ensureCommitIdentity(workspaceRoot)
+  }
+
   const opencodeBin = detectOpencodeBin()
   const result = await runOpencode({
     workspaceRoot,
@@ -623,7 +598,7 @@ async function main() {
     agent: "swe-bench",
   })
 
-  const patch = await captureGitDiff(workspaceRoot)
+  const patch = await capturePatch(workspaceRoot, args.patchMode, baselineCommit)
   const benchRunTime = (Date.now() - startedAt) / 1000
 
   const error = BenchTerminalError.toGymError(result.exitCode, result.terminalError)
@@ -634,11 +609,14 @@ async function main() {
     metrics: {
       bench_run_time: benchRunTime,
       opencode_exit_code: result.exitCode,
+      patch_mode: args.patchMode,
     },
     error,
   })
 
-  console.log(`[bench] wrote ${outPath} (patch=${patch.length} bytes, error=${error ?? "none"})`)
+  console.log(
+    `[bench] wrote ${outPath} (patch=${patch.length} bytes, mode=${args.patchMode}, error=${error ?? "none"})`,
+  )
 
   // Mirror opencode's exit code explicitly. Falling off the end of main() and
   // letting Bun drain the event loop produced a flaky exit=1 even when the
