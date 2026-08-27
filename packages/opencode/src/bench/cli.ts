@@ -33,7 +33,6 @@ import * as BenchTerminalError from "./terminal_error"
 import PROMPT_ANTHROPIC from "../session/prompt/anthropic.txt"
 import type { NemoGymReplayManifest, NemoGymReplayTurn } from "../provider/sdk/nemo-gym/language-model"
 import { parseReplayManifest, parseReplayMessages } from "./replay"
-import * as BenchTerminalError from "./terminal_error"
 
 interface CliArgs {
   instanceDictPath: string
