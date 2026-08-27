@@ -37,6 +37,7 @@ export type StreamInput = {
   user: MessageV2.User
   sessionID: string
   parentSessionID?: string
+  parentToolCallID?: string
   model: Provider.Model
   agent: Agent.Info
   permission?: Permission.Ruleset
@@ -381,6 +382,8 @@ const live: Layer.Layer<
             : {
                 "x-session-affinity": input.sessionID,
                 ...(input.parentSessionID ? { "x-parent-session-id": input.parentSessionID } : {}),
+                ...(input.parentToolCallID ? { "x-parent-tool-call-id": input.parentToolCallID } : {}),
+                "x-opencode-agent": input.agent.name,
                 "User-Agent": `opencode/${InstallationVersion}`,
               }),
           ...input.model.headers,

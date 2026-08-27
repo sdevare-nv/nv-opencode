@@ -31,6 +31,8 @@ import * as BenchTerminalError from "./terminal_error"
 // opencode's built-in anthropic system prompt — Bun bundles .txt as a string.
 // Used as the default when no --system-prompt override is passed.
 import PROMPT_ANTHROPIC from "../session/prompt/anthropic.txt"
+import type { NemoGymReplayManifest, NemoGymReplayTurn } from "../provider/sdk/nemo-gym/language-model"
+import { parseReplayManifest, parseReplayMessages } from "./replay"
 
 interface CliArgs {
   instanceDictPath: string
@@ -48,6 +50,13 @@ interface CliArgs {
   systemPromptPath?: string
   /** Enable opencode's `task` tool (spawns subagent sessions). */
   enableSubagents: boolean
+  /**
+   * Path to a JSON file of prior chat-completion-format messages to replay
+   * before continuing live (trajectory resume). See language-model.ts.
+   */
+  replayMessagesFile?: string
+  /** Causal parent-task-call -> recorded child-session replay graph. */
+  replaySubagentsFile?: string
   /** How the model patch is extracted at the end of the run. See ./patch.ts. */
   patchMode: PatchMode
 }
@@ -100,6 +109,12 @@ function parseArgs(argv: string[]): CliArgs {
         break
       case "--enable-subagents":
         out.enableSubagents = true
+        break
+      case "--replay-messages-file":
+        out.replayMessagesFile = next()
+        break
+      case "--replay-subagents-file":
+        out.replaySubagentsFile = next()
         break
       case "--patch-mode":
         out.patchMode = parsePatchMode(next())
@@ -162,6 +177,12 @@ async function buildConfigDir(args: {
   temperature?: number
   topP?: number
   maxTokens?: number
+  /** Scripted assistant turns to replay before the agent continues live. */
+  replayTurns?: NemoGymReplayTurn[]
+  /** Subsequent user messages trailing the last replayed turn. */
+  replayTrailingUserTexts?: string[]
+  /** Per-recorded-subagent replay queues and their parent task-call links. */
+  replayManifest?: NemoGymReplayManifest
 }): Promise<{ tmpRoot: string; configFile: string }> {
   const tmpRoot = await fs.mkdtemp(path.join(os.tmpdir(), `bench-${args.instanceId}-`))
   await fs.mkdir(tmpRoot, { recursive: true })
@@ -189,6 +210,9 @@ async function buildConfigDir(args: {
           ...(args.temperature !== undefined ? { temperature: args.temperature } : {}),
           ...(args.topP !== undefined ? { topP: args.topP } : {}),
           ...(args.maxTokens !== undefined ? { maxTokens: args.maxTokens } : {}),
+          ...(args.replayTurns?.length ? { replayTurns: args.replayTurns } : {}),
+          ...(args.replayTrailingUserTexts?.length ? { replayTrailingUserTexts: args.replayTrailingUserTexts } : {}),
+          ...(args.replayManifest ? { replayManifest: args.replayManifest } : {}),
         },
         models: {
           [args.modelName]: {
@@ -475,9 +499,29 @@ async function main() {
   const completionsDir = completionsDirFor(args.outputDir, instance.instance_id)
   await fs.mkdir(completionsDir, { recursive: true })
 
-  // The user message is fully rendered by gym (workspace_path baked in based
-  // on dataset_name); we just read it as-is and pass it to opencode.
-  const userPrompt = await fs.readFile(args.userMessageFile, "utf8")
+  // Trajectory resume: when a replay file is given, the recorded conversation's
+  // own first user message becomes the task instruction (byte-for-byte, not
+  // gym's rendered template — mirrors OpenHands' replay semantics) and the
+  // recorded assistant turns are threaded into the nemo-gym provider so it
+  // replays them (re-executing tool calls for real) before continuing live.
+  let userPrompt: string
+  let replayTurns: NemoGymReplayTurn[] | undefined
+  let replayTrailingUserTexts: string[] | undefined
+  let replayManifest: NemoGymReplayManifest | undefined
+  if (args.replayMessagesFile) {
+    const raw = await fs.readFile(args.replayMessagesFile, "utf8")
+    const parsed = parseReplayMessages(raw)
+    userPrompt = parsed.initialUserText
+    replayTurns = parsed.replayTurns
+    replayTrailingUserTexts = parsed.trailingUserTexts
+  } else {
+    // The user message is fully rendered by gym (workspace_path baked in based
+    // on dataset_name); we just read it as-is and pass it to opencode.
+    userPrompt = await fs.readFile(args.userMessageFile, "utf8")
+  }
+  if (args.replaySubagentsFile) {
+    replayManifest = parseReplayManifest(await fs.readFile(args.replaySubagentsFile, "utf8"))
+  }
 
   const { tmpRoot, configFile } = await buildConfigDir({
     instanceId: instance.instance_id,
@@ -486,10 +530,13 @@ async function main() {
     completionsDir,
     maxTurns: args.maxTurns,
     systemPromptPath: args.systemPromptPath,
-    enableSubagents: args.enableSubagents,
+    enableSubagents: args.enableSubagents || Boolean(replayManifest?.sessions.length),
     temperature: forcedTemperature,
     topP: forcedTopP,
     maxTokens: forcedMaxTokens,
+    replayTurns,
+    replayTrailingUserTexts,
+    replayManifest,
   })
 
   const startedAt = Date.now()
