@@ -215,8 +215,16 @@ async function buildConfigDir(args: {
   const keysFile = "/opencode_setup/mcp/tavily_keys.txt"
   let tavilyKey: string | undefined
   let tavilyDefaults: string | undefined
-  if (searchMode && !exaMode && existsSync(mcpEntry) && existsSync(keysFile)) {
-    const keys = (await fs.readFile(keysFile, "utf8"))
+  // Per-run Tavily key slice, bind-mounted by Gym (app.py) from this run's own log
+  // dir. Preferred over keysFile: keysFile is ONE path inside the single shared Gym
+  // checkout, read WHOLE, so the last fleet to stage its keys there silently
+  // repoints every already-running fleet at its pool and the disjoint offset that
+  // claim_tavily_keys.sh recorded never binds. A per-run file keeps each fleet on
+  // its own claimed slice and leaves mid-flight fleets untouched.
+  const runKeysFile = "/opencode_setup/mcp/tavily_keys_run.txt"
+  const activeKeysFile = existsSync(runKeysFile) ? runKeysFile : keysFile
+  if (searchMode && !exaMode && existsSync(mcpEntry) && existsSync(activeKeysFile)) {
+    const keys = (await fs.readFile(activeKeysFile, "utf8"))
       .split("\n")
       // the key cache stores JSON-style quoted strings ("tvly-prod-...") —
       // strip surrounding quotes or the API rejects the key as invalid
@@ -226,7 +234,9 @@ async function buildConfigDir(args: {
       let h = 0
       for (const ch of args.instanceId) h = (h * 31 + ch.charCodeAt(0)) >>> 0
       tavilyKey = keys[h % keys.length]
-      console.log(`[bench] search mode: tavily MCP enabled (key index ${h % keys.length} of ${keys.length})`)
+      console.log(
+        `[bench] search mode: tavily MCP enabled (key index ${h % keys.length} of ${keys.length} from ${activeKeysFile})`,
+      )
       // Search parameters, staged next to the keys by the gym setup script.
       const defaultsFile = "/opencode_setup/mcp/tavily_default_parameters.json"
       if (existsSync(defaultsFile)) {
