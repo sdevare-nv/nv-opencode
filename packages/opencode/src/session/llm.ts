@@ -37,6 +37,7 @@ export type StreamInput = {
   user: MessageV2.User
   sessionID: string
   parentSessionID?: string
+  parentToolCallID?: string
   model: Provider.Model
   agent: Agent.Info
   permission?: Permission.Ruleset
@@ -395,6 +396,8 @@ const live: Layer.Layer<
                 // Tag it so the provider can exclude it from capture entirely
                 // rather than let it corrupt turn/segment numbering.
                 ...(input.agent.name === "title" ? { "x-turn-kind": "title" } : {}),
+                ...(input.parentToolCallID ? { "x-parent-tool-call-id": input.parentToolCallID } : {}),
+                "x-opencode-agent": input.agent.name,
                 "User-Agent": `opencode/${InstallationVersion}`,
               }),
           ...input.model.headers,

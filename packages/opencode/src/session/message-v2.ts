@@ -378,6 +378,8 @@ const messageBase = {
 export const User = Schema.Struct({
   ...messageBase,
   role: Schema.Literal("user"),
+  /** Task tool call in the parent session that created this child session. */
+  parentToolCallID: Schema.optional(Schema.String),
   time: Schema.Struct({
     created: NonNegativeInt,
   }),

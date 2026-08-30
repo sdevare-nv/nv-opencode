@@ -61,6 +61,7 @@ import * as DateTime from "effect/DateTime"
 import { eq } from "@/storage/db"
 import * as Database from "@/storage/db"
 import { SessionTable } from "./session.sql"
+import * as BenchTerminalError from "@/bench/terminal_error"
 
 // @ts-ignore
 globalThis.AI_SDK_LOG_WARNINGS = false
@@ -943,6 +944,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
         id: input.messageID ?? MessageID.ascending(),
         role: "user",
         sessionID: input.sessionID,
+        parentToolCallID: input.parentToolCallID,
         time: { created: Date.now() },
         tools: input.tools,
         agent: ag.name,
@@ -1507,6 +1509,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
           }
           const maxSteps = agent.steps ?? Infinity
           const isLastStep = stepsSinceCompaction >= maxSteps
+          if (isLastStep) BenchTerminalError.report("max_iteration")
           msgs = yield* insertReminders({ messages: msgs, agent, session })
 
           const msg: MessageV2.Assistant = {
@@ -1596,6 +1599,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
               permission: session.permission,
               sessionID,
               parentSessionID: session.parentID,
+              parentToolCallID: lastUser.parentToolCallID,
               system,
               messages: [...modelMsgs, ...(isLastStep ? [{ role: "user" as const, content: MAX_STEPS }] : [])],
               tools,
@@ -1823,6 +1827,7 @@ const ModelRef = Schema.Struct({
 export const PromptInput = Schema.Struct({
   sessionID: SessionID,
   messageID: Schema.optional(MessageID),
+  parentToolCallID: Schema.optional(Schema.String),
   model: Schema.optional(ModelRef),
   agent: Schema.optional(Schema.String),
   noReply: Schema.optional(Schema.Boolean),

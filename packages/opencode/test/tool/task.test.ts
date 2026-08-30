@@ -196,6 +196,15 @@ describe("tool.task", () => {
       const sessions = yield* Session.Service
       const { chat, assistant } = yield* seed()
       const child = yield* sessions.create({ parentID: chat.id, title: "Existing child" })
+      yield* sessions.updateMessage({
+        id: MessageID.ascending(),
+        role: "user",
+        sessionID: child.id,
+        parentToolCallID: "call_spawn",
+        agent: "general",
+        model: ref,
+        time: { created: Date.now() },
+      })
       const tool = yield* TaskTool
       const def = yield* tool.init()
       let seen: SessionPrompt.PromptInput | undefined
@@ -211,6 +220,7 @@ describe("tool.task", () => {
         {
           sessionID: chat.id,
           messageID: assistant.id,
+          callID: "call_resume",
           agent: "build",
           abort: new AbortController().signal,
           extra: { promptOps },
@@ -226,6 +236,7 @@ describe("tool.task", () => {
       expect(result.metadata.sessionId).toBe(child.id)
       expect(result.output).toContain(`task_id: ${child.id}`)
       expect(seen?.sessionID).toBe(child.id)
+      expect(seen?.parentToolCallID).toBe("call_spawn")
     }),
   )
 

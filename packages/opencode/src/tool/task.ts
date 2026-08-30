@@ -100,6 +100,13 @@ export const TaskTool = Tool.define(
             })) ?? []),
           ],
         }))
+      const spawnMessage = session
+        ? (yield* sessions.messages({ sessionID: nextSession.id })).find(
+            (message) => message.info.role === "user" && message.info.parentToolCallID,
+          )
+        : undefined
+      const spawnToolCallID =
+        spawnMessage?.info.role === "user" ? (spawnMessage.info.parentToolCallID ?? ctx.callID) : ctx.callID
 
       const msg = yield* Effect.sync(() => MessageV2.get({ sessionID: ctx.sessionID, messageID: ctx.messageID }))
       if (msg.info.role !== "assistant") return yield* Effect.fail(new Error("Not an assistant message"))
@@ -138,6 +145,7 @@ export const TaskTool = Tool.define(
             const result = yield* ops.prompt({
               messageID,
               sessionID: nextSession.id,
+              parentToolCallID: spawnToolCallID,
               model: {
                 modelID: model.modelID,
                 providerID: model.providerID,
