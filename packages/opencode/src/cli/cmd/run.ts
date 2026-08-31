@@ -434,7 +434,7 @@ export const RunCommand = effectCmd({
 
         function emit(type: string, data: Record<string, unknown>) {
           if (args.format === "json") {
-            if (benchEventTypesOnly) {
+            if (benchEventTypesOnly && type !== "tool_use") {
               process.stdout.write(type + EOL)
               return true
             }
@@ -465,10 +465,14 @@ export const RunCommand = effectCmd({
 
             if (event.type === "message.part.updated") {
               const part = event.properties.part
+
+              if (part.type === "tool" && (part.state.status === "completed" || part.state.status === "error")) {
+                if (emit("tool_use", { sessionID: part.sessionID, part })) continue
+              }
+
               if (part.sessionID !== sessionID) continue
 
               if (part.type === "tool" && (part.state.status === "completed" || part.state.status === "error")) {
-                if (emit("tool_use", { part })) continue
                 if (part.state.status === "completed") {
                   tool(part)
                   continue

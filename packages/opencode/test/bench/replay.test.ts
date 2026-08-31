@@ -131,7 +131,13 @@ describe("parseReplayMessages", () => {
 
   test("joins array-of-parts user content for the initial instruction", () => {
     const raw = JSON.stringify([
-      { role: "user", content: [{ type: "text", text: "part one" }, { type: "text", text: "part two" }] },
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "part one" },
+          { type: "text", text: "part two" },
+        ],
+      },
     ])
     const { initialUserText } = parseReplayMessages(raw)
     expect(initialUserText).toBe("part one\npart two")
@@ -186,10 +192,7 @@ describe("parseReplayManifest", () => {
     )
 
     expect(manifest.rootSessionId).toBe("recorded-root")
-    expect(manifest.sessions.map((session) => session.sessionId)).toEqual([
-      "recorded-grandchild",
-      "recorded-child",
-    ])
+    expect(manifest.sessions.map((session) => session.sessionId)).toEqual(["recorded-grandchild", "recorded-child"])
     expect(manifest.sessions[0]).toMatchObject({
       parentSessionId: "recorded-child",
       spawnCallId: "call_nested",

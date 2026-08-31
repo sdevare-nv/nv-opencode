@@ -104,6 +104,9 @@ interface ChatResponseUsage {
   prompt_tokens?: number | null
   completion_tokens?: number | null
   total_tokens?: number | null
+  completion_tokens_details?: {
+    reasoning_tokens?: number | null
+  } | null
 }
 
 interface ChatResponse {
@@ -275,6 +278,17 @@ export class NemoGymLanguageModel implements LanguageModelV3 {
   private readonly rootRecordedSessionID: string | undefined
   private globalTurn = 0
   private readonly sessionStartGlobalTurn = new Map<string, number>()
+
+  private _requestKind(
+    messages: ChatRequestMessage[],
+    parentSessionID: string | undefined,
+  ): "agent" | "title" | "subagent" {
+    if (parentSessionID) return "subagent"
+    const titlePrompt = "Generate a title for this conversation:"
+    return messages.some((message) => message.role === "user" && JSON.stringify(message.content).includes(titlePrompt))
+      ? "title"
+      : "agent"
+  }
 
   constructor(modelId: string, cfg: NemoGymLanguageModelConfig) {
     this.modelId = modelId
@@ -566,7 +580,9 @@ export class NemoGymLanguageModel implements LanguageModelV3 {
 
     const { warnings, loggedMessages, requestParams, globalTurn, sessionStartGlobalTurn } =
       await this._buildRequestParams(options, session)
+    const requestStartedAt = Date.now()
     const { responseJson } = await this._postChat(requestParams)
+    const responseCompletedAt = Date.now()
 
     const choice = responseJson.choices[0]
     if (!choice) throw new Error("nemo-gym: empty choices in response")
@@ -602,6 +618,8 @@ export class NemoGymLanguageModel implements LanguageModelV3 {
       providerSpecificFields,
       requestParams,
       session,
+      requestStartedAt,
+      responseCompletedAt,
       globalTurn,
       sessionStartGlobalTurn,
     })
@@ -657,7 +675,9 @@ export class NemoGymLanguageModel implements LanguageModelV3 {
         controller.enqueue({ type: "stream-start", warnings })
 
         try {
+          const requestStartedAt = Date.now()
           const { responseJson } = await self._postChat(requestParams)
+          const responseCompletedAt = Date.now()
 
           const choice = responseJson.choices[0]
           if (!choice) throw new Error("nemo-gym: empty choices in response")
@@ -690,6 +710,8 @@ export class NemoGymLanguageModel implements LanguageModelV3 {
             providerSpecificFields,
             requestParams,
             session,
+            requestStartedAt,
+            responseCompletedAt,
             globalTurn,
             sessionStartGlobalTurn,
           })
@@ -1017,6 +1039,8 @@ export class NemoGymLanguageModel implements LanguageModelV3 {
     providerSpecificFields: Record<string, unknown>
     requestParams: Record<string, unknown>
     session: SessionHeaders
+    requestStartedAt: number
+    responseCompletedAt: number
     globalTurn: number
     sessionStartGlobalTurn: number
   }) {
@@ -1027,7 +1051,13 @@ export class NemoGymLanguageModel implements LanguageModelV3 {
       (args.session.parentSessionID ? this.liveToRecordedSession.get(args.session.parentSessionID) : undefined)
     if (this.cfg.onCompletion) {
       try {
-        await this.cfg.onCompletion({ turn, ...args })
+        await this.cfg.onCompletion({
+          turn,
+          messages: args.messages,
+          response: args.response,
+          providerSpecificFields: args.providerSpecificFields,
+          requestParams: args.requestParams,
+        })
       } catch (err) {
         console.warn(`[nemo-gym] onCompletion hook threw: ${String(err)}`)
       }
@@ -1064,7 +1094,10 @@ export class NemoGymLanguageModel implements LanguageModelV3 {
         turn,
         global_turn: args.globalTurn,
         session_start_global_turn: args.sessionStartGlobalTurn,
-        timestamp: Date.now() / 1000,
+        request_kind: this._requestKind(args.messages, args.session.parentSessionID),
+        request_started_at: args.requestStartedAt / 1000,
+        latency: (args.responseCompletedAt - args.requestStartedAt) / 1000,
+        timestamp: args.responseCompletedAt / 1000,
       }
       const tmp = `${fpath}.tmp`
       await fs.writeFile(tmp, JSON.stringify(payload))

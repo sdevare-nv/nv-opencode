@@ -73,7 +73,11 @@ export function parseReplayMessages(raw: string): ParsedReplay {
     if (msg.role === "assistant") {
       replayTurns.push({
         content: typeof msg.content === "string" ? msg.content : replayMessageText(msg.content) || null,
-        toolCalls: msg.tool_calls?.map((tc) => ({ id: tc.id, name: tc.function.name, arguments: tc.function.arguments })),
+        toolCalls: msg.tool_calls?.map((tc) => ({
+          id: tc.id,
+          name: tc.function.name,
+          arguments: tc.function.arguments,
+        })),
         ...(pendingUserTexts.length ? { precedingUserTexts: pendingUserTexts } : {}),
       })
       pendingUserTexts = []
