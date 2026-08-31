@@ -17,6 +17,35 @@
  * so a tool crash later cannot lose this turn's token IDs. The shape matches
  * openhands' `llm_completions/<id>/*.json` exactly so gym's
  * `get_openhands_trajectory_from_completions` reads it without changes.
+ *
+ * Replay: `cfg.replayTurns` drives the root session and `cfg.replayManifest`
+ * supplies one queue per recorded child. A live child is bound by its
+ * recorded parent plus the exact task call ID that created it, so parallel
+ * siblings and nested agents cannot consume one another's turns. Tool-bearing
+ * calls are answered from that session's scripted queue instead of a real
+ * HTTP call — same synthesized-stream shape as a real response, so
+ * opencode's *real* tool-execution path (streamText -> the AI-SDK `tool.execute` closures
+ * built in session/prompt.ts's resolveTools()) runs each replayed tool call
+ * for real against the live sandbox. This is required for correctness:
+ * SWE-bench agents mutate a git workspace and the final patch comes from
+ * `git diff`, so a replayed "edit"/"bash" call must actually happen on the
+ * fresh container, not just be asserted via stale recorded output text.
+ * Once the queue is exhausted, doStream/doGenerate fall through unchanged to
+ * the real HTTP path and the agent continues live. Scripted turns are never
+ * dumped to completionsDir: gym derives the replay/live boundary from the
+ * FIRST dumped completion's cumulative `messages` length, which must be the
+ * first live call (by then the replay prefix is already in session
+ * history), not a scripted one.
+ *
+ * Subsequent user messages (anything after the trajectory's first user
+ * message) are real request content, not an action to replay — there's
+ * nothing to "re-execute" for a plain user turn. Everything the caller sent
+ * has to be part of what the model sees, starting with the first live call
+ * and on every call after that. Since opencode's own session storage isn't
+ * writable from here (see bench/replay.ts's module docblock), these aren't
+ * persisted anywhere — `_buildRequestParams` re-splices them into the
+ * outgoing message list, at a fixed position relative to the replayed
+ * assistant turns, on every live doStream/doGenerate call.
  */
 
 import {
@@ -112,6 +141,37 @@ function isGymContextOverflowCompletion(choice: ChatResponseChoice): boolean {
 
 const TOKEN_ID_FIELDS = ["prompt_token_ids", "generation_token_ids", "generation_log_probs"] as const
 
+/** A single scripted assistant turn to replay before falling through to live model calls. */
+export interface NemoGymReplayTurn {
+  content: string | null
+  toolCalls?: Array<{ id: string; name: string; arguments: string }>
+  /**
+   * Subsequent user messages that occurred, in the original trajectory,
+   * immediately before this turn was originally generated. Not replayed as
+   * part of the scripted turn itself (a user message isn't an action) —
+   * spliced into every live request's message list once replay reaches this
+   * point. See the module docblock.
+   */
+  precedingUserTexts?: string[]
+}
+
+export interface NemoGymReplaySession {
+  sessionId: string
+  parentSessionId: string
+  spawnCallId: string
+  spawnIndex: number
+  subagentType?: string
+  messageCount: number
+  replayTurns: NemoGymReplayTurn[]
+  replayTrailingUserTexts?: string[]
+}
+
+export interface NemoGymReplayManifest {
+  version: 1
+  rootSessionId: string
+  sessions: NemoGymReplaySession[]
+}
+
 export interface NemoGymLanguageModelConfig {
   /** Provider id used to namespace providerMetadata. Defaults to "nemo-gym". */
   provider: string
@@ -158,11 +218,47 @@ export interface NemoGymLanguageModelConfig {
     providerSpecificFields: Record<string, unknown>
     requestParams: Record<string, unknown>
   }) => void | Promise<void>
+  /**
+   * Scripted assistant turns to replay in the root session before falling
+   * through to live HTTP calls. See the module docblock for why replayed
+   * tool calls must run for real rather than just replaying recorded text.
+   */
+  replayTurns?: NemoGymReplayTurn[]
+  /**
+   * Subsequent user messages after the last replayed assistant turn, with
+   * nothing recorded after them in the trajectory (trajectory ends on a
+   * user message). Spliced into every live request's message list, same as
+   * NemoGymReplayTurn.precedingUserTexts. See the module docblock.
+   */
+  replayTrailingUserTexts?: string[]
+  /** Causal parent-task-call -> recorded child-session replay graph. */
+  replayManifest?: NemoGymReplayManifest
 }
 
 // ---------------------------------------------------------------------------
 // Implementation
 // ---------------------------------------------------------------------------
+
+interface ReplayState {
+  recordedSessionID: string
+  recordedParentSessionID?: string
+  spawnCallID?: string
+  spawnIndex?: number
+  subagentType?: string
+  messageCount: number
+  turns: NemoGymReplayTurn[]
+  trailingUserTexts?: string[]
+  index: number
+  pendingUserInjections: Array<{ beforeAssistantOrdinal: number; text: string }>
+  livePrefixMessageCount?: number
+}
+
+interface SessionHeaders {
+  sessionID: string
+  parentSessionID: string | undefined
+  parentToolCallID: string | undefined
+  agentName: string | undefined
+}
 
 export class NemoGymLanguageModel implements LanguageModelV3 {
   readonly specificationVersion = "v3"
@@ -175,6 +271,13 @@ export class NemoGymLanguageModel implements LanguageModelV3 {
   // subagents spawned via the task tool get their own sessionID, so keeping
   // a Map keeps their dump filenames from clobbering the main session's.
   private readonly turnCounters: Map<string, number> = new Map()
+  private readonly replayByRecordedSession = new Map<string, ReplayState>()
+  private readonly replayChildBySpawn = new Map<string, string>()
+  private readonly liveToRecordedSession = new Map<string, string>()
+  private readonly recordedToLiveSession = new Map<string, string>()
+  private readonly rootRecordedSessionID: string | undefined
+  private globalTurn = 0
+  private readonly sessionStartGlobalTurn = new Map<string, number>()
 
   private _requestKind(
     messages: ChatRequestMessage[],
@@ -195,6 +298,34 @@ export class NemoGymLanguageModel implements LanguageModelV3 {
       requestTimeoutMs: cfg.requestTimeoutMs ?? 600_000,
       retries: cfg.retries ?? 3,
     }
+    this.rootRecordedSessionID = cfg.replayManifest?.rootSessionId ?? (cfg.replayTurns ? "__main__" : undefined)
+    if (this.rootRecordedSessionID) {
+      this.replayByRecordedSession.set(
+        this.rootRecordedSessionID,
+        this._makeReplayState({
+          recordedSessionID: this.rootRecordedSessionID,
+          messageCount: 0,
+          turns: cfg.replayTurns ?? [],
+          trailingUserTexts: cfg.replayTrailingUserTexts,
+        }),
+      )
+    }
+    for (const session of cfg.replayManifest?.sessions ?? []) {
+      this.replayByRecordedSession.set(
+        session.sessionId,
+        this._makeReplayState({
+          recordedSessionID: session.sessionId,
+          recordedParentSessionID: session.parentSessionId,
+          spawnCallID: session.spawnCallId,
+          spawnIndex: session.spawnIndex,
+          subagentType: session.subagentType,
+          messageCount: session.messageCount,
+          turns: session.replayTurns,
+          trailingUserTexts: session.replayTrailingUserTexts,
+        }),
+      )
+      this.replayChildBySpawn.set(this._spawnKey(session.parentSessionId, session.spawnCallId), session.sessionId)
+    }
   }
 
   private _nextTurn(sessionID: string): number {
@@ -203,17 +334,212 @@ export class NemoGymLanguageModel implements LanguageModelV3 {
     return n
   }
 
-  private _sessionFromHeaders(headers: unknown): { sessionID: string; parentSessionID: string | undefined } {
+  private _nextGlobalTurn(sessionID: string): { globalTurn: number; sessionStartGlobalTurn: number } {
+    const globalTurn = this.cfg.turnCounter?.next() ?? this.globalTurn++
+    const sessionStartGlobalTurn = this.sessionStartGlobalTurn.get(sessionID) ?? globalTurn
+    this.sessionStartGlobalTurn.set(sessionID, sessionStartGlobalTurn)
+    return { globalTurn, sessionStartGlobalTurn }
+  }
+
+  private _makeReplayState(
+    input: Omit<ReplayState, "index" | "pendingUserInjections" | "livePrefixMessageCount">,
+  ): ReplayState {
+    return {
+      ...input,
+      index: 0,
+      pendingUserInjections: [
+        ...input.turns.flatMap((turn, i) =>
+          (turn.precedingUserTexts ?? []).map((text) => ({ beforeAssistantOrdinal: i, text })),
+        ),
+        ...(input.trailingUserTexts ?? []).map((text) => ({
+          beforeAssistantOrdinal: input.turns.length,
+          text,
+        })),
+      ],
+    }
+  }
+
+  private _spawnKey(parentSessionID: string, callID: string): string {
+    return `${parentSessionID}\u0000${callID}`
+  }
+
+  private _sessionFromHeaders(headers: unknown): SessionHeaders {
     let sid = ""
     let pid: string | undefined
+    let callID: string | undefined
+    let agentName: string | undefined
     if (headers && typeof headers === "object") {
       const h = headers as Record<string, unknown>
       const v = h["x-session-affinity"] ?? h["X-Session-Affinity"]
       if (typeof v === "string") sid = v
       const p = h["x-parent-session-id"] ?? h["X-Parent-Session-Id"]
       if (typeof p === "string") pid = p
+      const c = h["x-parent-tool-call-id"] ?? h["X-Parent-Tool-Call-Id"]
+      if (typeof c === "string") callID = c
+      const a = h["x-opencode-agent"] ?? h["X-Opencode-Agent"]
+      if (typeof a === "string") agentName = a
     }
-    return { sessionID: sid || "main", parentSessionID: pid }
+    return { sessionID: sid || "main", parentSessionID: pid, parentToolCallID: callID, agentName }
+  }
+
+  private _bindReplaySession(liveSessionID: string, recordedSessionID: string): ReplayState | undefined {
+    const existing = this.liveToRecordedSession.get(liveSessionID)
+    if (existing && existing !== recordedSessionID) {
+      throw new Error(
+        `nemo-gym replay: live session ${liveSessionID} is already bound to ${existing}, cannot bind ${recordedSessionID}`,
+      )
+    }
+    const otherLive = this.recordedToLiveSession.get(recordedSessionID)
+    if (otherLive && otherLive !== liveSessionID) {
+      throw new Error(
+        `nemo-gym replay: recorded session ${recordedSessionID} is already bound to ${otherLive}, cannot bind ${liveSessionID}`,
+      )
+    }
+    this.liveToRecordedSession.set(liveSessionID, recordedSessionID)
+    this.recordedToLiveSession.set(recordedSessionID, liveSessionID)
+    return this.replayByRecordedSession.get(recordedSessionID)
+  }
+
+  private _replayState(session: SessionHeaders): ReplayState | undefined {
+    const recorded = this.liveToRecordedSession.get(session.sessionID)
+    if (recorded) return this.replayByRecordedSession.get(recorded)
+    if (!session.parentSessionID) {
+      if (!this.rootRecordedSessionID) return undefined
+      return this._bindReplaySession(session.sessionID, this.rootRecordedSessionID)
+    }
+    if (!session.parentToolCallID) return undefined
+    const recordedParent = this.liveToRecordedSession.get(session.parentSessionID)
+    if (!recordedParent) return undefined
+    const recordedChild = this.replayChildBySpawn.get(this._spawnKey(recordedParent, session.parentToolCallID))
+    if (!recordedChild) return undefined
+    return this._bindReplaySession(session.sessionID, recordedChild)
+  }
+
+  // Auxiliary title/summary calls never pass tools, so they must not consume
+  // a session's scripted agentic-loop turns.
+  private _popReplayTurn(session: SessionHeaders, hasTools: boolean): NemoGymReplayTurn | undefined {
+    if (!hasTools) return undefined
+    const replay = this._replayState(session)
+    if (!replay || replay.index >= replay.turns.length) return undefined
+    return replay.turns[replay.index++]
+  }
+
+  private _rewriteTaskResumeArguments(tool: NonNullable<NemoGymReplayTurn["toolCalls"]>[number]): string {
+    if (tool.name !== "task" || !tool.arguments.includes('"task_id"')) return tool.arguments
+    let parsed: unknown
+    try {
+      parsed = JSON.parse(tool.arguments)
+    } catch {
+      return tool.arguments
+    }
+    if (!parsed || typeof parsed !== "object") return tool.arguments
+    const input = parsed as Record<string, unknown>
+    if (typeof input.task_id !== "string") return tool.arguments
+    const liveSessionID = this.recordedToLiveSession.get(input.task_id)
+    if (!liveSessionID) return tool.arguments
+    return JSON.stringify({ ...input, task_id: liveSessionID })
+  }
+
+  private _messageFromReplayTurn(turn: NemoGymReplayTurn): ChatResponseChoice["message"] {
+    return {
+      role: "assistant",
+      content: turn.content,
+      tool_calls: turn.toolCalls?.map((tc) => ({
+        id: tc.id,
+        type: "function" as const,
+        function: { name: tc.name, arguments: this._rewriteTaskResumeArguments(tc) },
+      })),
+    }
+  }
+
+  private _replayFinishReason(turn: NemoGymReplayTurn): string {
+    return turn.toolCalls && turn.toolCalls.length > 0 ? "tool_calls" : "stop"
+  }
+
+  // Shared by the real HTTP path and the replay path so both stay in sync:
+  // reasoning -> text -> tool-call stream parts for one assistant turn.
+  private _enqueueMessageParts(
+    controller: ReadableStreamDefaultController<LanguageModelV3StreamPart>,
+    msg: Pick<ChatResponseChoice["message"], "content" | "reasoning_text" | "tool_calls">,
+    providerMetadata: SharedV3ProviderMetadata,
+  ) {
+    // Reasoning content. providerMetadata on the *-end events is persisted by
+    // opencode's processor as part.metadata and replayed on the next request
+    // as part.providerOptions["nemo-gym"] — this is how per-turn token IDs
+    // round-trip so EVERY assistant turn (not just the last) carries them for
+    // RL training reconstruction. Replay turns carry no token IDs (empty
+    // providerMetadata), which is fine — gym never reads a dump for them.
+    if (msg.reasoning_text) {
+      controller.enqueue({ type: "reasoning-start", id: "reasoning-0" })
+      controller.enqueue({ type: "reasoning-delta", id: "reasoning-0", delta: msg.reasoning_text })
+      controller.enqueue({ type: "reasoning-end", id: "reasoning-0", providerMetadata })
+    }
+
+    // Text content.
+    if (msg.content) {
+      controller.enqueue({ type: "text-start", id: "txt-0" })
+      controller.enqueue({ type: "text-delta", id: "txt-0", delta: msg.content })
+      controller.enqueue({ type: "text-end", id: "txt-0", providerMetadata })
+    }
+
+    // Tool calls. Replayed tool-call IDs are reused verbatim (see
+    // _messageFromReplayTurn) so gym's replay/live boundary matching by
+    // call_id still lines up.
+    if (msg.tool_calls) {
+      for (const tc of msg.tool_calls) {
+        const tcId = tc.id ?? `call_${Math.random().toString(36).slice(2, 10)}`
+        controller.enqueue({
+          type: "tool-input-start",
+          id: tcId,
+          toolName: tc.function.name,
+        })
+        controller.enqueue({
+          type: "tool-input-delta",
+          id: tcId,
+          delta: tc.function.arguments,
+        })
+        controller.enqueue({ type: "tool-input-end", id: tcId })
+        controller.enqueue({
+          type: "tool-call",
+          toolCallId: tcId,
+          toolName: tc.function.name,
+          input: tc.function.arguments,
+        })
+      }
+    }
+  }
+
+  // Re-splices subsequent-user-message text from the replay trajectory into
+  // the outgoing message list, in place. Processed in descending ordinal
+  // order so inserting a later text doesn't shift the index about to be
+  // looked up for an earlier one.
+  private _injectPendingUserMessages(messages: ChatRequestMessage[], replay: ReplayState | undefined): void {
+    if (!replay?.pendingUserInjections.length) return
+    const byOrdinal = new Map<number, string[]>()
+    for (const { beforeAssistantOrdinal, text } of replay.pendingUserInjections) {
+      const list = byOrdinal.get(beforeAssistantOrdinal) ?? []
+      list.push(text)
+      byOrdinal.set(beforeAssistantOrdinal, list)
+    }
+    const ordinals = [...byOrdinal.keys()].sort((a, b) => b - a)
+    for (const ordinal of ordinals) {
+      const idx = this._findAssistantOrdinalIndex(messages, ordinal)
+      const texts = byOrdinal.get(ordinal)!
+      messages.splice(idx, 0, ...texts.map((text) => ({ role: "user" as const, content: text })))
+    }
+  }
+
+  // Index right before the `ordinal`-th (0-based) assistant-role message, or
+  // messages.length if fewer than `ordinal` assistant messages exist yet.
+  private _findAssistantOrdinalIndex(messages: ChatRequestMessage[], ordinal: number): number {
+    let seen = 0
+    for (let i = 0; i < messages.length; i++) {
+      if (messages[i].role === "assistant") {
+        if (seen === ordinal) return i
+        seen++
+      }
+    }
+    return messages.length
   }
 
   get supportedUrls() {
@@ -223,9 +549,37 @@ export class NemoGymLanguageModel implements LanguageModelV3 {
   // The streamText path in `session/llm.ts` only calls doStream. We still
   // implement doGenerate for completeness / future direct-use.
   async doGenerate(options: LanguageModelV3CallOptions) {
-    const { warnings, loggedMessages, requestParams } = await this._buildRequestParams(options)
     const session = this._sessionFromHeaders(options.headers)
-    const turn = this._nextTurn(session.sessionID)
+    const replayTurn = this._popReplayTurn(session, Boolean(options.tools && options.tools.length > 0))
+
+    if (replayTurn) {
+      const msg = this._messageFromReplayTurn(replayTurn)
+      const providerMetadata = this._buildProviderMetadata({})
+      const content: LanguageModelV3Content[] = []
+      if (msg.content) content.push({ type: "text", text: msg.content, providerMetadata })
+      if (msg.tool_calls) {
+        for (const tc of msg.tool_calls) {
+          content.push({
+            type: "tool-call",
+            toolCallId: tc.id ?? `call_${Math.random().toString(36).slice(2, 10)}`,
+            toolName: tc.function.name,
+            input: tc.function.arguments,
+          })
+        }
+      }
+      return {
+        content,
+        finishReason: this._mapFinishReason(this._replayFinishReason(replayTurn)),
+        usage: this._mapUsage(undefined),
+        providerMetadata,
+        request: { body: "{}" },
+        response: { body: {} },
+        warnings: [],
+      }
+    }
+
+    const { warnings, loggedMessages, requestParams, globalTurn, sessionStartGlobalTurn } =
+      await this._buildRequestParams(options, session)
     const requestStartedAt = Date.now()
     const { responseJson } = await this._postChat(requestParams)
     const responseCompletedAt = Date.now()
@@ -264,9 +618,10 @@ export class NemoGymLanguageModel implements LanguageModelV3 {
       providerSpecificFields,
       requestParams,
       session,
-      turn,
       requestStartedAt,
       responseCompletedAt,
+      globalTurn,
+      sessionStartGlobalTurn,
     })
 
     return {
@@ -281,8 +636,35 @@ export class NemoGymLanguageModel implements LanguageModelV3 {
   }
 
   async doStream(options: LanguageModelV3CallOptions) {
-    const { warnings, loggedMessages, requestParams } = await this._buildRequestParams(options)
     const session = this._sessionFromHeaders(options.headers)
+    const replayTurn = this._popReplayTurn(session, Boolean(options.tools && options.tools.length > 0))
+
+    if (replayTurn) {
+      const msg = this._messageFromReplayTurn(replayTurn)
+      const finishReasonRaw = this._replayFinishReason(replayTurn)
+      const self = this
+      const stream = new ReadableStream<LanguageModelV3StreamPart>({
+        start(controller) {
+          controller.enqueue({ type: "stream-start", warnings: [] })
+          const providerMetadata = self._buildProviderMetadata({})
+          self._enqueueMessageParts(controller, msg, providerMetadata)
+          // No _dumpAndNotify here — see the module docblock: gym derives the
+          // replay/live boundary from the FIRST dumped completion, which must
+          // be the first live call.
+          controller.enqueue({
+            type: "finish",
+            finishReason: self._mapFinishReason(finishReasonRaw),
+            usage: self._mapUsage(undefined),
+            providerMetadata,
+          })
+          controller.close()
+        },
+      })
+      return { stream, request: { body: "{}" }, response: {} }
+    }
+
+    const { warnings, loggedMessages, requestParams, globalTurn, sessionStartGlobalTurn } =
+      await this._buildRequestParams(options, session)
 
     // Fire the HTTP call eagerly so any error surfaces synchronously when the
     // stream is consumed. We then synthesize parts in `start`.
@@ -293,7 +675,6 @@ export class NemoGymLanguageModel implements LanguageModelV3 {
         controller.enqueue({ type: "stream-start", warnings })
 
         try {
-          const turn = self._nextTurn(session.sessionID)
           const requestStartedAt = Date.now()
           const { responseJson } = await self._postChat(requestParams)
           const responseCompletedAt = Date.now()
@@ -319,47 +700,7 @@ export class NemoGymLanguageModel implements LanguageModelV3 {
             timestamp: responseJson.created ? new Date(responseJson.created * 1000) : undefined,
           })
 
-          // Reasoning content. providerMetadata on the *-end events is
-          // persisted by opencode's processor as part.metadata and replayed
-          // on the next request as part.providerOptions["nemo-gym"] — this is
-          // how per-turn token IDs round-trip so EVERY assistant turn (not
-          // just the last) carries them for RL training reconstruction.
-          if (msg.reasoning_text) {
-            controller.enqueue({ type: "reasoning-start", id: "reasoning-0" })
-            controller.enqueue({ type: "reasoning-delta", id: "reasoning-0", delta: msg.reasoning_text })
-            controller.enqueue({ type: "reasoning-end", id: "reasoning-0", providerMetadata })
-          }
-
-          // Text content.
-          if (msg.content) {
-            controller.enqueue({ type: "text-start", id: "txt-0" })
-            controller.enqueue({ type: "text-delta", id: "txt-0", delta: msg.content })
-            controller.enqueue({ type: "text-end", id: "txt-0", providerMetadata })
-          }
-
-          // Tool calls.
-          if (msg.tool_calls) {
-            for (const tc of msg.tool_calls) {
-              const tcId = tc.id ?? `call_${Math.random().toString(36).slice(2, 10)}`
-              controller.enqueue({
-                type: "tool-input-start",
-                id: tcId,
-                toolName: tc.function.name,
-              })
-              controller.enqueue({
-                type: "tool-input-delta",
-                id: tcId,
-                delta: tc.function.arguments,
-              })
-              controller.enqueue({ type: "tool-input-end", id: tcId })
-              controller.enqueue({
-                type: "tool-call",
-                toolCallId: tcId,
-                toolName: tc.function.name,
-                input: tc.function.arguments,
-              })
-            }
-          }
+          self._enqueueMessageParts(controller, msg, providerMetadata)
 
           // Persist trajectory BEFORE finishing so a downstream tool crash
           // cannot lose this turn's token IDs.
@@ -369,9 +710,10 @@ export class NemoGymLanguageModel implements LanguageModelV3 {
             providerSpecificFields,
             requestParams,
             session,
-            turn,
             requestStartedAt,
             responseCompletedAt,
+            globalTurn,
+            sessionStartGlobalTurn,
           })
 
           controller.enqueue({
@@ -406,13 +748,18 @@ export class NemoGymLanguageModel implements LanguageModelV3 {
   // Helpers
   // -----------------------------------------------------------------------
 
-  private async _buildRequestParams(options: LanguageModelV3CallOptions): Promise<{
+  private async _buildRequestParams(
+    options: LanguageModelV3CallOptions,
+    session: SessionHeaders,
+  ): Promise<{
     warnings: SharedV3Warning[]
     messages: ChatRequestMessage[]
     loggedMessages: ChatRequestMessage[]
     tools: unknown
     toolChoice: unknown
     requestParams: Record<string, unknown>
+    globalTurn: number
+    sessionStartGlobalTurn: number
   }> {
     const warnings: SharedV3Warning[] = []
     // Reuse opencode's existing OpenAI-compatible message converter so all
@@ -436,6 +783,17 @@ export class NemoGymLanguageModel implements LanguageModelV3 {
       }
     }
 
+    // Trajectory resume: splice in any subsequent user messages from the
+    // replay trajectory (see bench/replay.ts + the module docblock for why
+    // these can't just be persisted into opencode's own session storage).
+    // Done here, before loggedMessages is cloned from messages below, so the
+    // wire request and the trajectory dump gym reads both include them
+    // identically. Re-applied on every call — nothing else carries them
+    // forward — at a position fixed relative to the replayed assistant
+    // turns, so they land in the same chronological spot every time.
+    const replay = this._replayState(session)
+    this._injectPendingUserMessages(messages as ChatRequestMessage[], replay)
+
     // Token-ID handling, mirroring OpenHands' nemo_gym_client.py exactly:
     //   - WIRE request: token IDs on the MOST RECENT assistant message only
     //     (the last turn's prompt_token_ids embed the exact token stream of
@@ -455,6 +813,9 @@ export class NemoGymLanguageModel implements LanguageModelV3 {
     const loggedMessages = (messages as Array<Record<string, unknown>>).map((m) => ({
       ...m,
     })) as unknown as ChatRequestMessage[]
+    if (replay && options.tools?.length && replay.livePrefixMessageCount === undefined) {
+      replay.livePrefixMessageCount = loggedMessages.length
+    }
     {
       const promptAssistants = options.prompt.filter((m) => m.role === "assistant")
       const wireAssistants = (messages as Array<Record<string, unknown>>).filter((m) => m["role"] === "assistant")
@@ -536,7 +897,15 @@ export class NemoGymLanguageModel implements LanguageModelV3 {
       if (requestParams[k] === undefined) delete requestParams[k]
     }
 
-    return { warnings, messages, loggedMessages, tools, toolChoice, requestParams }
+    return {
+      warnings,
+      messages,
+      loggedMessages,
+      tools,
+      toolChoice,
+      requestParams,
+      ...this._nextGlobalTurn(session.sessionID),
+    }
   }
 
   private async _postChat(params: Record<string, unknown>): Promise<{ responseJson: ChatResponse }> {
@@ -669,15 +1038,21 @@ export class NemoGymLanguageModel implements LanguageModelV3 {
     response: ChatResponse
     providerSpecificFields: Record<string, unknown>
     requestParams: Record<string, unknown>
-    session: { sessionID: string; parentSessionID: string | undefined }
-    turn: number
+    session: SessionHeaders
     requestStartedAt: number
     responseCompletedAt: number
+    globalTurn: number
+    sessionStartGlobalTurn: number
   }) {
+    const turn = this._nextTurn(args.session.sessionID)
+    const replay = this._replayState(args.session)
+    const recordedParentSessionID =
+      replay?.recordedParentSessionID ??
+      (args.session.parentSessionID ? this.liveToRecordedSession.get(args.session.parentSessionID) : undefined)
     if (this.cfg.onCompletion) {
       try {
         await this.cfg.onCompletion({
-          turn: args.turn,
+          turn,
           messages: args.messages,
           response: args.response,
           providerSpecificFields: args.providerSpecificFields,
@@ -692,7 +1067,7 @@ export class NemoGymLanguageModel implements LanguageModelV3 {
 
     try {
       await fs.mkdir(this.cfg.completionsDir, { recursive: true })
-      const turnStr = String(args.turn).padStart(4, "0")
+      const turnStr = String(turn).padStart(4, "0")
       const safeModel = this.modelId.replace(/\//g, "__")
       // sessionID is part of the filename so subagent dumps don't clobber the
       // main session's. Sanitized for filesystem safety.
@@ -710,7 +1085,15 @@ export class NemoGymLanguageModel implements LanguageModelV3 {
         kwargs,
         session_id: args.session.sessionID,
         parent_session_id: args.session.parentSessionID ?? null,
-        turn: args.turn,
+        recorded_session_id: replay?.recordedSessionID ?? null,
+        recorded_parent_session_id: recordedParentSessionID ?? null,
+        spawn_call_id: replay?.spawnCallID ?? args.session.parentToolCallID ?? null,
+        spawn_index: replay?.spawnIndex ?? null,
+        subagent_type: replay?.subagentType ?? args.session.agentName ?? null,
+        replay_prefix_message_count: replay?.livePrefixMessageCount ?? null,
+        turn,
+        global_turn: args.globalTurn,
+        session_start_global_turn: args.sessionStartGlobalTurn,
         request_kind: this._requestKind(args.messages, args.session.parentSessionID),
         request_started_at: args.requestStartedAt / 1000,
         latency: (args.responseCompletedAt - args.requestStartedAt) / 1000,

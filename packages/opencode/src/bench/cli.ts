@@ -16,7 +16,8 @@
  *
  * Trajectory capture: the nemo-gym provider (registered via this config)
  * writes `<completionsDir>/<turn>.json` per LLM call BEFORE returning. On
- * exit we capture `git diff` and write `output.jsonl`.
+ * exit we capture the model patch (see ./patch.ts for the two modes) and write
+ * `output.jsonl`.
  */
 
 import { existsSync, promises as fs, readFileSync } from "node:fs"
@@ -31,10 +32,13 @@ import {
   updateNemoGymMetrics,
   type ActionExecutionLatencyMetric,
 } from "./metrics"
+import { capturePatch, ensureCommitIdentity, parsePatchMode, recordBaselineCommit, type PatchMode } from "./patch"
 import * as BenchTerminalError from "./terminal_error"
 // opencode's built-in anthropic system prompt — Bun bundles .txt as a string.
 // Used as the default when no --system-prompt override is passed.
 import PROMPT_ANTHROPIC from "../session/prompt/anthropic.txt"
+import type { NemoGymReplayManifest, NemoGymReplayTurn } from "../provider/sdk/nemo-gym/language-model"
+import { parseReplayManifest, parseReplayMessages } from "./replay"
 
 interface CliArgs {
   instanceDictPath: string
@@ -52,6 +56,15 @@ interface CliArgs {
   systemPromptPath?: string
   /** Enable opencode's `task` tool (spawns subagent sessions). */
   enableSubagents: boolean
+  /**
+   * Path to a JSON file of prior chat-completion-format messages to replay
+   * before continuing live (trajectory resume). See language-model.ts.
+   */
+  replayMessagesFile?: string
+  /** Causal parent-task-call -> recorded child-session replay graph. */
+  replaySubagentsFile?: string
+  /** How the model patch is extracted at the end of the run. See ./patch.ts. */
+  patchMode: PatchMode
 }
 
 function parseArgs(argv: string[]): CliArgs {
@@ -61,6 +74,7 @@ function parseArgs(argv: string[]): CliArgs {
     dataset: "",
     split: "test",
     enableSubagents: false,
+    patchMode: parsePatchMode(undefined),
   }
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]
@@ -101,6 +115,15 @@ function parseArgs(argv: string[]): CliArgs {
         break
       case "--enable-subagents":
         out.enableSubagents = true
+        break
+      case "--replay-messages-file":
+        out.replayMessagesFile = next()
+        break
+      case "--replay-subagents-file":
+        out.replaySubagentsFile = next()
+        break
+      case "--patch-mode":
+        out.patchMode = parsePatchMode(next())
         break
       default:
         if (a.startsWith("--")) throw new Error(`Unknown flag: ${a}`)
@@ -160,6 +183,12 @@ async function buildConfigDir(args: {
   temperature?: number
   topP?: number
   maxTokens?: number
+  /** Scripted assistant turns to replay before the agent continues live. */
+  replayTurns?: NemoGymReplayTurn[]
+  /** Subsequent user messages trailing the last replayed turn. */
+  replayTrailingUserTexts?: string[]
+  /** Per-recorded-subagent replay queues and their parent task-call links. */
+  replayManifest?: NemoGymReplayManifest
 }): Promise<{ tmpRoot: string; configFile: string }> {
   const tmpRoot = await fs.mkdtemp(path.join(os.tmpdir(), `bench-${args.instanceId}-`))
   await fs.mkdir(tmpRoot, { recursive: true })
@@ -187,6 +216,9 @@ async function buildConfigDir(args: {
           ...(args.temperature !== undefined ? { temperature: args.temperature } : {}),
           ...(args.topP !== undefined ? { topP: args.topP } : {}),
           ...(args.maxTokens !== undefined ? { maxTokens: args.maxTokens } : {}),
+          ...(args.replayTurns?.length ? { replayTurns: args.replayTurns } : {}),
+          ...(args.replayTrailingUserTexts?.length ? { replayTrailingUserTexts: args.replayTrailingUserTexts } : {}),
+          ...(args.replayManifest ? { replayManifest: args.replayManifest } : {}),
         },
         models: {
           [args.modelName]: {
@@ -200,6 +232,9 @@ async function buildConfigDir(args: {
       },
     },
     agent: {
+      title: {
+        disable: true,
+      },
       "swe-bench": {
         mode: "primary",
         model: `nemo-gym/${args.modelName}`,
@@ -335,16 +370,6 @@ async function buildConfigDir(args: {
   return { tmpRoot, configFile }
 }
 
-// Some SIFs ship with bare PATH lookups that ENOENT on bare program names
-// through Bun's posix_spawn. Resolve to an absolute path up front for any
-// binary we shell out to.
-function detectBin(candidates: string[]): string | null {
-  for (const p of candidates) {
-    if (existsSync(p)) return p
-  }
-  return null
-}
-
 function runOpencode(args: {
   workspaceRoot: string
   modelName: string
@@ -436,25 +461,6 @@ function runOpencode(args: {
   })
 }
 
-async function captureGitDiff(workspaceRoot: string): Promise<string> {
-  const gitPath = detectBin(["/usr/bin/git", "/bin/git", "/usr/local/bin/git"]) ?? "git"
-  const runGit = (args: string[], capture: boolean): Promise<string> =>
-    new Promise((resolve) => {
-      const child = spawn(gitPath, ["-C", workspaceRoot, ...args], {
-        env: { ...process.env, GIT_PAGER: "cat" },
-      })
-      let stdout = ""
-      if (capture) child.stdout?.on("data", (b) => (stdout += b.toString("utf8")))
-      child.on("close", () => resolve(stdout))
-      child.on("error", () => resolve(""))
-    })
-  // Mark untracked files as intent-to-add so newly-created files appear in
-  // `git diff` without being committed. Plain `git diff` only shows changes
-  // to tracked files, which silently drops new-file patches the agent wrote.
-  await runGit(["add", "-AN"], false)
-  return runGit(["diff", "--binary"], true)
-}
-
 interface OutputJsonl {
   instance_id: string
   test_result: { git_patch: string }
@@ -517,9 +523,29 @@ async function main() {
   const completionsDir = completionsDirFor(args.outputDir, instance.instance_id)
   await fs.mkdir(completionsDir, { recursive: true })
 
-  // The user message is fully rendered by gym (workspace_path baked in based
-  // on dataset_name); we just read it as-is and pass it to opencode.
-  const userPrompt = await fs.readFile(args.userMessageFile, "utf8")
+  // Trajectory resume: when a replay file is given, the recorded conversation's
+  // own first user message becomes the task instruction (byte-for-byte, not
+  // gym's rendered template — mirrors OpenHands' replay semantics) and the
+  // recorded assistant turns are threaded into the nemo-gym provider so it
+  // replays them (re-executing tool calls for real) before continuing live.
+  let userPrompt: string
+  let replayTurns: NemoGymReplayTurn[] | undefined
+  let replayTrailingUserTexts: string[] | undefined
+  let replayManifest: NemoGymReplayManifest | undefined
+  if (args.replayMessagesFile) {
+    const raw = await fs.readFile(args.replayMessagesFile, "utf8")
+    const parsed = parseReplayMessages(raw)
+    userPrompt = parsed.initialUserText
+    replayTurns = parsed.replayTurns
+    replayTrailingUserTexts = parsed.trailingUserTexts
+  } else {
+    // The user message is fully rendered by gym (workspace_path baked in based
+    // on dataset_name); we just read it as-is and pass it to opencode.
+    userPrompt = await fs.readFile(args.userMessageFile, "utf8")
+  }
+  if (args.replaySubagentsFile) {
+    replayManifest = parseReplayManifest(await fs.readFile(args.replaySubagentsFile, "utf8"))
+  }
 
   const { tmpRoot, configFile } = await buildConfigDir({
     instanceId: instance.instance_id,
@@ -528,10 +554,13 @@ async function main() {
     completionsDir,
     maxTurns: args.maxTurns,
     systemPromptPath: args.systemPromptPath,
-    enableSubagents: args.enableSubagents,
+    enableSubagents: args.enableSubagents || Boolean(replayManifest?.sessions.length),
     temperature: forcedTemperature,
     topP: forcedTopP,
     maxTokens: forcedMaxTokens,
+    replayTurns,
+    replayTrailingUserTexts,
+    replayManifest,
   })
 
   const childEnv: NodeJS.ProcessEnv = {
@@ -558,7 +587,7 @@ async function main() {
   }
 
   // Bootstrap a git repo if the SIF shipped a flat source tree (swe-bench-ext
-  // and some SWE-rebench variants). Without this, captureGitDiff returns ""
+  // and some SWE-rebench variants). Without this, the patch capture returns ""
   // and every patch is recorded as 0 bytes.
   const { freshInit } = await bootstrapRepoIfMissing(workspaceRoot)
 
@@ -569,6 +598,16 @@ async function main() {
   // already the correct baseline (also tagged `opencode_bench_baseline`).
   if (!freshInit) {
     await runDeepReset(workspaceRoot, String(instance.base_commit ?? ""))
+  }
+
+  // Snapshot the pristine HEAD *after* bootstrap/deep-reset — it is the diff
+  // base for `--patch-mode committed`. Recorded unconditionally so the log
+  // always shows what the agent started from.
+  const baselineCommit = await recordBaselineCommit(workspaceRoot)
+  console.log(`[bench] patch_mode=${args.patchMode} baseline=${baselineCommit || "<none>"}`)
+  if (args.patchMode === "committed") {
+    // The agent is expected to commit; make sure git will let it.
+    await ensureCommitIdentity(workspaceRoot)
   }
 
   const opencodeBin = detectOpencodeBin()
@@ -583,7 +622,7 @@ async function main() {
     agent: "swe-bench",
   })
 
-  const patch = await captureGitDiff(workspaceRoot)
+  const patch = await capturePatch(workspaceRoot, args.patchMode, baselineCommit)
   const benchRunTime = (Date.now() - startedAt) / 1000
   const completionMetrics = await collectCompletionMetrics(completionsDir)
   const perTurnMetrics = {
@@ -604,11 +643,14 @@ async function main() {
       bench_run_time: benchRunTime,
       opencode_exit_code: result.exitCode,
       ...perTurnMetrics,
+      patch_mode: args.patchMode,
     },
     error,
   })
 
-  console.log(`[bench] wrote ${outPath} (patch=${patch.length} bytes, error=${error ?? "none"})`)
+  console.log(
+    `[bench] wrote ${outPath} (patch=${patch.length} bytes, mode=${args.patchMode}, error=${error ?? "none"})`,
+  )
 
   // Mirror opencode's exit code explicitly. Falling off the end of main() and
   // letting Bun drain the event loop produced a flaky exit=1 even when the

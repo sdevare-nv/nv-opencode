@@ -14,6 +14,9 @@
 #   $10 WORKSPACE_ROOT     resolved repo path inside the SIF (gym side decided)
 #   $11 USER_MESSAGE_PATH  pre-rendered user prompt file (workspace baked in)
 #   $12 SYSTEM_PROMPT_PATH optional system-prompt override
+#   $13 REPLAY_MESSAGES_PATH optional JSON file of prior chat-completion
+#                          messages to replay before continuing live
+#   $14 REPLAY_SUBAGENTS_PATH optional causal subagent replay manifest
 #
 # Environment (set by gym):
 #   NEMO_GYM_MODEL_SERVER_NAME      proxy name on the gym head server
@@ -23,6 +26,11 @@
 #   COMMAND_EXEC_TIMEOUT            per-bash-command timeout in seconds
 #   DIVERSIFY_TOOL_NAMES            optional: rename tools for RL diversity
 #   CAMEL_CASE_TOOL_NAMES           optional: camelCase tool names
+#   PATCH_MODE                      optional: how the model patch is extracted.
+#                                   `worktree` (default) = `git diff` of the
+#                                   working tree; `committed` = diff of what the
+#                                   agent committed, for task families whose
+#                                   prompt asks the agent to commit its work.
 
 set -eo pipefail
 
@@ -38,6 +46,8 @@ CONFIG_FILE="${9:-/tmp/oc_config.json}"
 WORKSPACE_ROOT="${10:-}"
 USER_MESSAGE_PATH="${11:-}"
 SYSTEM_PROMPT_PATH="${12:-}"
+REPLAY_MESSAGES_PATH="${13:-}"
+REPLAY_SUBAGENTS_PATH="${14:-}"
 
 if [ -z "$SELECTED_ID" ]; then
     echo "ERROR: SELECTED_ID (\$7) is required."
@@ -91,7 +101,10 @@ echo "INSTANCE_DICT_PATH: $INSTANCE_DICT_PATH"
 echo "CONFIG_FILE: $CONFIG_FILE"
 echo "WORKSPACE_ROOT: $WORKSPACE_ROOT"
 echo "USER_MESSAGE_PATH: $USER_MESSAGE_PATH"
+echo "PATCH_MODE: ${PATCH_MODE:-worktree (default)}"
 echo "SYSTEM_PROMPT_PATH: $SYSTEM_PROMPT_PATH"
+echo "REPLAY_MESSAGES_PATH: $REPLAY_MESSAGES_PATH"
+echo "REPLAY_SUBAGENTS_PATH: $REPLAY_SUBAGENTS_PATH"
 echo "MODEL_SERVER: $NEMO_GYM_MODEL_SERVER_NAME @ $NEMO_GYM_MODEL_SERVER_BASE_URL"
 
 cmd=(
@@ -110,8 +123,18 @@ cmd=(
 if [ -n "$SYSTEM_PROMPT_PATH" ]; then
     cmd+=(--system-prompt "$SYSTEM_PROMPT_PATH")
 fi
+if [ -n "$REPLAY_MESSAGES_PATH" ]; then
+    cmd+=(--replay-messages-file "$REPLAY_MESSAGES_PATH")
+fi
+if [ -n "$REPLAY_SUBAGENTS_PATH" ]; then
+    cmd+=(--replay-subagents-file "$REPLAY_SUBAGENTS_PATH")
+fi
 if [ "${ENABLE_SUBAGENTS:-0}" = "1" ] || [ "${ENABLE_SUBAGENTS:-}" = "true" ]; then
     cmd+=(--enable-subagents)
+fi
+# Omitted entirely when unset so cli.ts keeps its own default (`worktree`).
+if [ -n "${PATCH_MODE:-}" ]; then
+    cmd+=(--patch-mode "$PATCH_MODE")
 fi
 
 echo "Executing: ${cmd[*]}"
