@@ -650,7 +650,19 @@ export const layer: Layer.Layer<
         const error = parse(e)
         if (MessageV2.ContextOverflowError.isInstance(error)) {
           BenchTerminalError.report("context_window")
-          ctx.needsCompaction = true
+          // With compaction disabled (RL no-compaction arms), a ceiling hit must
+          // END the session: setting needsCompaction here fires the overflow
+          // reset/continuation and emits a MULTI-SEGMENT trajectory, which
+          // NeMo-RL's token-prefix contiguity assert rejects — one such
+          // trajectory tore down an 18-node run (job 6764672). Single-segment
+          // context_window endings postprocess fine (masked sample, judge 0).
+          if ((yield* config.get()).compaction?.auto !== false) {
+            ctx.needsCompaction = true
+          } else {
+            console.log(
+              `[mercor][ceiling] context overflow with compaction disabled -- ending session ${ctx.sessionID} single-segment`,
+            )
+          }
           yield* bus.publish(Session.Event.Error, { sessionID: ctx.sessionID, error })
           return
         }
