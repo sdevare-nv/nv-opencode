@@ -658,13 +658,17 @@ export const layer: Layer.Layer<
           // context_window endings postprocess fine (masked sample, judge 0).
           if ((yield* config.get()).compaction?.auto !== false) {
             ctx.needsCompaction = true
-          } else {
-            console.log(
-              `[mercor][ceiling] context overflow with compaction disabled -- ending session ${ctx.sessionID} single-segment`,
-            )
+            yield* bus.publish(Session.Event.Error, { sessionID: ctx.sessionID, error })
+            return
           }
-          yield* bus.publish(Session.Event.Error, { sessionID: ctx.sessionID, error })
-          return
+          console.log(
+            `[mercor][ceiling] context overflow with compaction disabled -- ending session ${ctx.sessionID} single-segment`,
+          )
+          // Fall through to the generic fatal-error path: it sets
+          // ctx.assistantMessage.error (process() -> "stop", breaking the prompt
+          // loop) and status idle (the bench run loop exits on it). An early
+          // return here leaves both unset, so the loop re-issues the same
+          // over-ceiling request until the container memory watchdog fires.
         }
         if (!ctx.assistantMessage.summary) {
           // TODO(v2): Temporary dual-write while migrating session messages to v2 events.
