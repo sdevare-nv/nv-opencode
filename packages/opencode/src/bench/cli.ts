@@ -560,6 +560,7 @@ async function main() {
     // This is bench-only and does not alter normal opencode runs.
     [BenchTerminalError.ENV]: "1",
     // Avoid serializing and piping full event payloads into the gym log.
+    // Events that already have start/end time still include it.
     OPENCODE_BENCH_EVENT_TYPES_ONLY: "1",
   }
 

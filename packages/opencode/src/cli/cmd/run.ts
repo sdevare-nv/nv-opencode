@@ -435,7 +435,12 @@ export const RunCommand = effectCmd({
         function emit(type: string, data: Record<string, unknown>) {
           if (args.format === "json") {
             if (benchEventTypesOnly) {
-              process.stdout.write(type + EOL)
+              // data is `{ part }` (or `{ error }`). Time already lives on the
+              // part when the model/tool actually timed it: part.time for
+              // text/reasoning, part.state.time for tool_use. step_start has none.
+              const part = data.part as { time?: unknown; state?: { time?: unknown } } | undefined
+              const time = part?.time ?? part?.state?.time
+              process.stdout.write(JSON.stringify(time ? { type, time } : { type }) + EOL)
               return true
             }
             process.stdout.write(JSON.stringify({ type, timestamp: Date.now(), sessionID, ...data }) + EOL)
