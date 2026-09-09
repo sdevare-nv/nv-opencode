@@ -19,7 +19,6 @@ import { Instruction } from "./instruction"
 import { Plugin } from "../plugin"
 import PROMPT_PLAN from "../session/prompt/plan.txt"
 import BUILD_SWITCH from "../session/prompt/build-switch.txt"
-import MAX_STEPS from "../session/prompt/max-steps.txt"
 import { ToolRegistry } from "@/tool/registry"
 import { MCP } from "../mcp"
 import { LSP } from "@/lsp/lsp"
@@ -1404,16 +1403,16 @@ NOTE: At any point in time through this workflow you should feel free to ask the
         const ctx = yield* InstanceState.context
         const slog = elog.with({ sessionID })
         let structured: unknown
+        // NeMo-Gym: ONE turn budget per SESSION. `step` is never reset --
+        // compaction does not refill it (the pre-09-08 `stepsSinceCompaction`
+        // reset made `agent.steps` unreachable: measured longest segment was
+        // 140 against a 400 cap, so the cap never once fired across 5 bc400
+        // runs). `step` counts MODEL-CALL iterations only: the proactive
+        // overflow branch below refunds its increment because it makes no
+        // model call. Compaction summarizer turns DO count (they are real
+        // generations, and counting them keeps the create<->process cycle
+        // from spinning forever without advancing the budget).
         let step = 0
-        // NeMo-Gym: `agent.steps` (agent_max_turns) is meant to bound each
-        // on-policy SEGMENT independently, not the whole session -- a
-        // session that compacts N times should get up to N+1 segments'
-        // worth of turn budget, not share one pool across all of them
-        // (matches segment_index tracking in
-        // provider/sdk/nemo-gym/language-model.ts). Kept separate from
-        // `step` itself so the one-time title-generation trigger
-        // (`step === 1`) doesn't refire after every compaction.
-        let stepsSinceCompaction = 0
         const session = yield* sessions.get(sessionID).pipe(Effect.orDie)
 
         while (true) {
@@ -1459,7 +1458,6 @@ NOTE: At any point in time through this workflow you should feel free to ask the
           }
 
           step++
-          stepsSinceCompaction++
           if (step === 1)
             yield* title({
               session,
@@ -1485,8 +1483,6 @@ NOTE: At any point in time through this workflow you should feel free to ask the
               overflow: task.overflow,
             })
             if (result === "stop") break
-            // Fresh segment, fresh budget -- see stepsSinceCompaction above.
-            stepsSinceCompaction = 0
             continue
           }
 
@@ -1496,6 +1492,11 @@ NOTE: At any point in time through this workflow you should feel free to ask the
             (yield* compaction.isOverflow({ tokens: lastFinished.tokens, model }))
           ) {
             yield* compaction.create({ sessionID, agent: lastUser.agent, model: lastUser.model, auto: true })
+            // Refund: this iteration only wrote a compaction task part and made
+            // NO model call, so it must not consume the turn budget. (The other
+            // create path -- `result === "compact"` in the outcome block below --
+            // rides on a real turn that already paid, so it needs no refund.)
+            step--
             continue
           }
 
@@ -1508,8 +1509,23 @@ NOTE: At any point in time through this workflow you should feel free to ask the
             throw error
           }
           const maxSteps = agent.steps ?? Infinity
-          const isLastStep = stepsSinceCompaction >= maxSteps
-          if (isLastStep) BenchTerminalError.report("max_iteration")
+          // HARD STOP on a session-global budget. `step` was incremented at the
+          // top of THIS iteration, so `step > maxSteps` means the model already
+          // completed `maxSteps` model calls and is asking for one more -- cut
+          // it here, before the call. Two consequences that are load-bearing:
+          //   * A session that finishes naturally on turn `maxSteps` exits via
+          //     the normal break above (which runs BEFORE step++), so it never
+          //     reports max_iteration and is NOT masked from training.
+          //   * A session cut here reports max_iteration -> gym's
+          //     _classify_agent_error -> agent_error_kind="max_iteration" ->
+          //     mask_sample (truncated trajectory, like context_window).
+          // The rollout is still written and graded either way:
+          // shouldExitSuccessfully() keeps exit code 0 for a known terminal kind.
+          if (step > maxSteps) {
+            yield* slog.info("max steps reached, stopping session", { step, maxSteps })
+            BenchTerminalError.report("max_iteration")
+            break
+          }
           msgs = yield* insertReminders({ messages: msgs, agent, session })
 
           const msg: MessageV2.Assistant = {
@@ -1601,7 +1617,13 @@ NOTE: At any point in time through this workflow you should feel free to ask the
               parentSessionID: session.parentID,
               parentToolCallID: lastUser.parentToolCallID,
               system,
-              messages: [...modelMsgs, ...(isLastStep ? [{ role: "user" as const, content: MAX_STEPS }] : [])],
+              // No max-steps nudge: the budget is enforced by the hard stop
+              // above, not by asking the model to wrap up. The old injection
+              // appended an EPHEMERAL user message that was never persisted, so
+              // once it started firing it re-appended at a shifting position on
+              // every subsequent turn -- breaking turn-to-turn prompt_token_ids
+              // contiguity in the RL data (same class of bug as a54dac8c6).
+              messages: modelMsgs,
               tools,
               model,
               toolChoice: format.type === "json_schema" ? "required" : undefined,
