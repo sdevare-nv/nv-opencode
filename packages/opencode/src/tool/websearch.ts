@@ -2,6 +2,7 @@ import { Effect, Schema } from "effect"
 import { HttpClient } from "effect/unstable/http"
 import * as Tool from "./tool"
 import * as McpExa from "./mcp-exa"
+import { filterSearchOutput } from "./webfilter"
 import DESCRIPTION from "./websearch.txt"
 
 export const Parameters = Schema.Struct({
@@ -60,8 +61,11 @@ export const WebSearchTool = Tool.define(
             "25 seconds",
           )
 
+          // TDM opt-out exclusion + BrowseComp contamination guard. Applied to
+          // the raw provider response BEFORE it reaches the model. No-op for
+          // exclusion when OPENCODE_WEBSEARCH_EXCLUDE_DOMAINS is unset.
           return {
-            output: result ?? "No search results found. Please try a different query.",
+            output: filterSearchOutput(result, "websearch") ?? "No search results found. Please try a different query.",
             title: `Web search: ${params.query}`,
             metadata: {},
           }

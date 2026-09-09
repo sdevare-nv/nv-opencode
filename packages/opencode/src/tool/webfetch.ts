@@ -4,6 +4,7 @@ import * as Tool from "./tool"
 import TurndownService from "turndown"
 import DESCRIPTION from "./webfetch.txt"
 import { isImageAttachment } from "@/util/media"
+import { isExcludedUrl, EMPTY_RESULT } from "./webfilter"
 
 const MAX_RESPONSE_SIZE = 5 * 1024 * 1024 // 5MB
 const DEFAULT_TIMEOUT = 30 * 1000 // 30 seconds
@@ -32,6 +33,16 @@ export const WebFetchTool = Tool.define(
         Effect.gen(function* () {
           if (!params.url.startsWith("http://") && !params.url.startsWith("https://")) {
             throw new Error("URL must start with http:// or https://")
+          }
+
+          // TDM opt-out enforcement. Unlike websearch (which filters the
+          // response), webfetch is a direct fetch of a URL the model chose, so
+          // the check belongs on the INPUT — we must not retrieve the page at
+          // all. Returns the same neutral string an empty fetch would, so the
+          // model learns nothing about why. No-op when the env is unset.
+          if (isExcludedUrl(params.url)) {
+            console.error(`[browsecomp][excludedomains] fn=webfetch blocked=1 url=${params.url}`)
+            return { output: EMPTY_RESULT, title: params.url, metadata: {} }
           }
 
           yield* ctx.ask({

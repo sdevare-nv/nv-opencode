@@ -297,6 +297,31 @@ async function buildConfigDir(args: {
       console.log(
         `[bench] search mode: EXA enabled (native websearch -> mcp.exa.ai, per-instance key index ${idx} of ${exaPool.length}, ${exaPool[idx]!.slice(0, 9)}****); tavily MCP bypassed`,
       )
+      // TDM opt-out parity with the tavily arm. mcp.exa.ai IGNORES
+      // excludeDomains server-side, so tool/webfilter.ts enforces the list
+      // client-side; feed it from the SAME staged registry file tavily uses so
+      // there is one source of truth. Absent file => no exclusions (stock
+      // behaviour), which is what every exa run before 09-09 did.
+      // Primary delivery is the forwarded env var (gym app.py --env list), because
+      // the mcp/ dir is NOT mounted when DISABLE_TAVILY_MCP=1 -- i.e. on every exa
+      // run. The file read below is a fallback for setups that do mount it.
+      const exaDefaultsFile = "/opencode_setup/mcp/tavily_default_parameters.json"
+      if (process.env["OPENCODE_WEBSEARCH_EXCLUDE_DOMAINS"]) {
+        const n = process.env["OPENCODE_WEBSEARCH_EXCLUDE_DOMAINS"].split(/[,:]/).filter(Boolean).length
+        console.log(`[bench] exa exclude-domains: ${n} domains from OPENCODE_WEBSEARCH_EXCLUDE_DOMAINS`)
+      } else if (existsSync(exaDefaultsFile)) {
+        try {
+          const doms = JSON.parse(await fs.readFile(exaDefaultsFile, "utf8")).exclude_domains ?? []
+          if (Array.isArray(doms) && doms.length > 0) {
+            process.env["OPENCODE_WEBSEARCH_EXCLUDE_DOMAINS"] = JSON.stringify(doms)
+            console.log(`[bench] exa exclude-domains: ${doms.length} domains loaded from ${exaDefaultsFile}`)
+          }
+        } catch (e) {
+          console.log(`[bench] WARNING: could not parse ${exaDefaultsFile} — exa runs with NO domain exclusions: ${e}`)
+        }
+      } else {
+        console.log(`[bench] WARNING: ${exaDefaultsFile} missing — exa runs with NO domain exclusions`)
+      }
     } else {
       console.log(
         `[bench] search mode: EXA enabled (native websearch -> mcp.exa.ai, single key ${(process.env["EXA_API_KEY"] ?? "").slice(0, 9)}****, no EXA_API_KEYS pool); tavily MCP bypassed`,
