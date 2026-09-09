@@ -1466,6 +1466,42 @@ NOTE: At any point in time through this workflow you should feel free to ask the
               history: msgs,
             }).pipe(Effect.ignore, Effect.forkIn(scope))
 
+          const agent = yield* agents.get(lastUser.agent)
+          if (!agent) {
+            const available = (yield* agents.list()).filter((a) => !a.hidden).map((a) => a.name)
+            const hint = available.length ? ` Available agents: ${available.join(", ")}` : ""
+            const error = new NamedError.Unknown({ message: `Agent not found: "${lastUser.agent}".${hint}` })
+            yield* bus.publish(Session.Event.Error, { sessionID, error: error.toObject() })
+            throw error
+          }
+          const maxSteps = agent.steps ?? Infinity
+          // HARD STOP on a session-global budget. `step` was incremented at the
+          // top of THIS iteration, so `step > maxSteps` means the model already
+          // completed `maxSteps` model calls and is asking for one more -- cut it
+          // here, before the call.
+          //
+          // MUST be checked BEFORE the subtask/compaction/overflow dispatch
+          // below: the compaction branch makes a summarizer model call and then
+          // `continue`s, so a check placed after it is skipped on exactly the
+          // iterations that compaction owns. Measured with the check below the
+          // dispatch: a 12-turn cap produced 13 model calls (smoke arm A,
+          // instances 0003/0004) because the 13th was a summarizer turn.
+          //
+          // Two consequences that are load-bearing:
+          //   * A session that finishes naturally on turn `maxSteps` exits via
+          //     the normal break above (which runs BEFORE step++), so it never
+          //     reports max_iteration and is NOT masked from training.
+          //   * A session cut here reports max_iteration -> gym's
+          //     _classify_agent_error -> agent_error_kind="max_iteration" ->
+          //     mask_sample (truncated trajectory, like context_window).
+          // The rollout is still written and graded either way:
+          // shouldExitSuccessfully() keeps exit code 0 for a known terminal kind.
+          if (step > maxSteps) {
+            yield* slog.info("max steps reached, stopping session", { step, maxSteps })
+            BenchTerminalError.report("max_iteration")
+            break
+          }
+
           const model = yield* getModel(lastUser.model.providerID, lastUser.model.modelID, sessionID)
           const task = tasks.pop()
 
@@ -1500,32 +1536,6 @@ NOTE: At any point in time through this workflow you should feel free to ask the
             continue
           }
 
-          const agent = yield* agents.get(lastUser.agent)
-          if (!agent) {
-            const available = (yield* agents.list()).filter((a) => !a.hidden).map((a) => a.name)
-            const hint = available.length ? ` Available agents: ${available.join(", ")}` : ""
-            const error = new NamedError.Unknown({ message: `Agent not found: "${lastUser.agent}".${hint}` })
-            yield* bus.publish(Session.Event.Error, { sessionID, error: error.toObject() })
-            throw error
-          }
-          const maxSteps = agent.steps ?? Infinity
-          // HARD STOP on a session-global budget. `step` was incremented at the
-          // top of THIS iteration, so `step > maxSteps` means the model already
-          // completed `maxSteps` model calls and is asking for one more -- cut
-          // it here, before the call. Two consequences that are load-bearing:
-          //   * A session that finishes naturally on turn `maxSteps` exits via
-          //     the normal break above (which runs BEFORE step++), so it never
-          //     reports max_iteration and is NOT masked from training.
-          //   * A session cut here reports max_iteration -> gym's
-          //     _classify_agent_error -> agent_error_kind="max_iteration" ->
-          //     mask_sample (truncated trajectory, like context_window).
-          // The rollout is still written and graded either way:
-          // shouldExitSuccessfully() keeps exit code 0 for a known terminal kind.
-          if (step > maxSteps) {
-            yield* slog.info("max steps reached, stopping session", { step, maxSteps })
-            BenchTerminalError.report("max_iteration")
-            break
-          }
           msgs = yield* insertReminders({ messages: msgs, agent, session })
 
           const msg: MessageV2.Assistant = {
