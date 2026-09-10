@@ -141,7 +141,11 @@ export const restSearch = (
       const data = yield* decodeRest(body)
       const elapsed = Date.now() - started
       const results = data.results ?? []
-      console.log(
+      // stderr, not stdout: every other diagnostic in this tree ([exa-cache],
+      // webfilter, webfetch) logs to console.error, and stdout does not
+      // reliably surface in the Gym driver log from inside the rollout
+      // container -- a console.log here is invisible even when deep fires.
+      console.error(
         `[exa-rest] type=${args.type} ms=${elapsed} cost=${data.costDollars?.total ?? "?"} ` +
           `n=${results.length} deep_answer=${data.output?.content ? 1 : 0} query=${JSON.stringify(args.query.slice(0, 120))}`,
       )
