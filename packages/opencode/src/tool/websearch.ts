@@ -2,6 +2,7 @@ import { Effect, Schema } from "effect"
 import { HttpClient } from "effect/unstable/http"
 import * as Tool from "./tool"
 import * as McpExa from "./mcp-exa"
+import * as ExaCache from "./exa-cache"
 import { filterSearchOutput } from "./webfilter"
 import DESCRIPTION from "./websearch.txt"
 
@@ -47,6 +48,18 @@ export const WebSearchTool = Tool.define(
             },
           })
 
+          // Cache consult first (sidecar reachable only when Gym configured a
+          // search cache; see exa-cache.ts). Cached value is the PRE-filter
+          // rendered SERP, so webfilter still applies below on both paths.
+          const cached = ExaCache.enabled() ? yield* Effect.promise(() => ExaCache.lookup(params.query)) : undefined
+          if (cached !== undefined) {
+            return {
+              output: filterSearchOutput(cached, "websearch") ?? "No search results found. Please try a different query.",
+              title: `Web search: ${params.query}`,
+              metadata: {},
+            }
+          }
+
           // OPENCODE_WEBSEARCH_TYPE forces every search through Exa's REST
           // /search with that type (mcp.exa.ai drops `type`, so deep modes
           // only exist on the REST path). Unset = stock MCP, byte-identical.
@@ -72,6 +85,12 @@ export const WebSearchTool = Tool.define(
                 },
                 "25 seconds",
               )
+
+          // Write-through: cache the raw rendered SERP (pre-filter) so future
+          // exact/fuzzy lookups in this run and later runs are API-free.
+          if (ExaCache.enabled() && typeof result === "string" && result.length > 0) {
+            yield* Effect.promise(() => ExaCache.put(params.query, result))
+          }
 
           // TDM opt-out exclusion + BrowseComp contamination guard. Applied to
           // the raw provider response BEFORE it reaches the model. No-op for
