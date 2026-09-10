@@ -47,19 +47,31 @@ export const WebSearchTool = Tool.define(
             },
           })
 
-          const result = yield* McpExa.call(
-            http,
-            "web_search_exa",
-            McpExa.SearchArgs,
-            {
-              query: params.query,
-              type: params.type || "auto",
-              numResults: params.numResults || 8,
-              livecrawl: params.livecrawl || "fallback",
-              contextMaxCharacters: params.contextMaxCharacters,
-            },
-            "25 seconds",
-          )
+          // OPENCODE_WEBSEARCH_TYPE forces every search through Exa's REST
+          // /search with that type (mcp.exa.ai drops `type`, so deep modes
+          // only exist on the REST path). Unset = stock MCP, byte-identical.
+          const forcedType = process.env.OPENCODE_WEBSEARCH_TYPE?.trim()
+          const result = forcedType
+            ? yield* McpExa.restSearch(http, {
+                query: params.query,
+                type: forcedType,
+                numResults: params.numResults || 8,
+                livecrawl: params.livecrawl || "fallback",
+                contextMaxCharacters: params.contextMaxCharacters,
+              })
+            : yield* McpExa.call(
+                http,
+                "web_search_exa",
+                McpExa.SearchArgs,
+                {
+                  query: params.query,
+                  type: params.type || "auto",
+                  numResults: params.numResults || 8,
+                  livecrawl: params.livecrawl || "fallback",
+                  contextMaxCharacters: params.contextMaxCharacters,
+                },
+                "25 seconds",
+              )
 
           // TDM opt-out exclusion + BrowseComp contamination guard. Applied to
           // the raw provider response BEFORE it reaches the model. No-op for
