@@ -167,8 +167,14 @@ export const restSearch = (
       if (blocks.length === 0) return undefined
       return blocks.join("\n\n")
     })
-    // one retry keeps transient 429s/5xxs from burning an agent turn
-    return yield* attempt.pipe(Effect.orElse(() => attempt))
+    // No retry wrapper here: this `effect` build has no `Effect.orElse`
+    // (verified against node_modules/effect/dist/Effect.d.ts -- only `retry`
+    // and `orDie` exist). An earlier `Effect.orElse(() => attempt)` compiled
+    // fine (bun build does not typecheck) and then threw
+    // "exports_Effect.orElse is not a function" at runtime, so EVERY search
+    // returned that string to the model as its tool output. The stock MCP
+    // path has no retry either; match it rather than invent one blind.
+    return yield* attempt
   })
 
 export const call = <F extends Schema.Struct.Fields>(
