@@ -54,7 +54,12 @@ export function enabled(): boolean {
 
 /** Exact-or-fuzzy lookup. Returns the cached rendered SERP text, or undefined on miss. */
 export async function lookup(query: string): Promise<string | undefined> {
-  const data = await post("/search", { query }, LOOKUP_TIMEOUT_MS)
+  // Ask the sidecar for an EXA entry specifically. Without this the fuzzy index
+  // is provider-blind and returns one winner, which in a ~99.9%-tavily corpus is
+  // almost always a tavily row -- rejected two lines below and scored as a miss
+  // with no second chance (measured: 1 HIT / 641 lookups on RL job 7073774).
+  // Older sidecars ignore the extra field, so this is backward compatible.
+  const data = await post("/search", { query, provider: "exa" }, LOOKUP_TIMEOUT_MS)
   if (data?.hit === true && data.provider === "exa" && typeof data.results === "string" && data.results.length > 0) {
     console.error(`[exa-cache] HIT query=${JSON.stringify(query.slice(0, 120))}`)
     return data.results
