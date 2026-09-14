@@ -435,6 +435,13 @@ export const RunCommand = effectCmd({
         function emit(type: string, data: Record<string, unknown>) {
           if (args.format === "json") {
             if (benchEventTypesOnly) {
+              // The bench wrapper needs the completed tool payload to collect
+              // detailed metrics. It compacts the payload before forwarding it.
+              if (type === "tool_use") {
+                process.stdout.write(JSON.stringify({ type, timestamp: Date.now(), sessionID, ...data }) + EOL)
+                return true
+              }
+
               // data is `{ part }` (or `{ error }`). Time already lives on the
               // part when the model/tool actually timed it: part.time for
               // text/reasoning, part.state.time for tool_use. step_start has none.
@@ -470,10 +477,14 @@ export const RunCommand = effectCmd({
 
             if (event.type === "message.part.updated") {
               const part = event.properties.part
+
+              if (part.type === "tool" && (part.state.status === "completed" || part.state.status === "error")) {
+                if (emit("tool_use", { sessionID: part.sessionID, part })) continue
+              }
+
               if (part.sessionID !== sessionID) continue
 
               if (part.type === "tool" && (part.state.status === "completed" || part.state.status === "error")) {
-                if (emit("tool_use", { part })) continue
                 if (part.state.status === "completed") {
                   tool(part)
                   continue

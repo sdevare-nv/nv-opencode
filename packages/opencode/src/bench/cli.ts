@@ -26,6 +26,12 @@ import os from "node:os"
 import { spawn } from "node:child_process"
 import { runDeepReset } from "./deep_reset"
 import { bootstrapRepoIfMissing } from "./bootstrap_repo"
+import {
+  collectCompletionMetrics,
+  parseToolExecutionMetric,
+  updateNemoGymMetrics,
+  type ActionExecutionLatencyMetric,
+} from "./metrics"
 import { capturePatch, ensureCommitIdentity, parsePatchMode, recordBaselineCommit, type PatchMode } from "./patch"
 import * as BenchTerminalError from "./terminal_error"
 // opencode's built-in anthropic system prompt — Bun bundles .txt as a string.
@@ -371,7 +377,13 @@ function runOpencode(args: {
   env: NodeJS.ProcessEnv
   opencodeBin: string
   agent: string
-}): Promise<{ exitCode: number; stdout: string; stderr: string; terminalError?: BenchTerminalError.Kind }> {
+}): Promise<{
+  exitCode: number
+  stdout: string
+  stderr: string
+  actionExecutionLatencies: ActionExecutionLatencyMetric[]
+  terminalError?: BenchTerminalError.Kind
+}> {
   // Use the same bun binary that's currently running — guaranteed to exist
   // and avoids PATH lookup quirks under Bun's posix_spawn.
   const bunPath = process.execPath
@@ -411,15 +423,31 @@ function runOpencode(args: {
     }
     const MAX_KEEP = 256 * 1024 // keep only a bounded tail for error reporting
     let lineBuf = ""
+    const actionExecutionLatencies = new Map<string, ActionExecutionLatencyMetric>()
     child.stdout?.on("data", (b) => {
       const chunk = b.toString("utf8")
       observeTerminalSignal(chunk)
       lineBuf += chunk
       let idx: number
       while ((idx = lineBuf.indexOf("\n")) >= 0) {
-        const line = lineBuf.slice(0, idx)
+        const rawLine = lineBuf.slice(0, idx)
         lineBuf = lineBuf.slice(idx + 1)
-        // Forward the event type so the gym log captures progress cheaply.
+        const actionMetric = parseToolExecutionMetric(rawLine)
+        if (actionMetric) {
+          const metricID = `${actionMetric.session_id}:${actionMetric.observation_id}`
+          actionExecutionLatencies.set(metricID, actionMetric)
+        }
+        // Keep full tool details in metrics, but expose only the event type and
+        // timing to the outer Gym log so large inputs and outputs are not duplicated.
+        const line = actionMetric
+          ? JSON.stringify({
+              type: "tool_use",
+              time: {
+                start: Date.parse(actionMetric.start_timestamp),
+                end: Date.parse(actionMetric.timestamp),
+              },
+            })
+          : rawLine
         process.stdout.write(line + "\n")
         stdout = (stdout + line + "\n").slice(-MAX_KEEP)
       }
@@ -430,10 +458,13 @@ function runOpencode(args: {
       stderr = (stderr + chunk).slice(-MAX_KEEP)
       process.stderr.write(chunk)
     })
-    child.on("close", (code) => resolve({ exitCode: code ?? 0, stdout, stderr, terminalError }))
+    const metrics = () => [...actionExecutionLatencies.values()].sort((a, b) => a.timestamp.localeCompare(b.timestamp))
+    child.on("close", (code) =>
+      resolve({ exitCode: code ?? 0, stdout, stderr, actionExecutionLatencies: metrics(), terminalError }),
+    )
     child.on("error", (err) => {
       stderr += String(err)
-      resolve({ exitCode: 999, stdout, stderr, terminalError })
+      resolve({ exitCode: 999, stdout, stderr, actionExecutionLatencies: metrics(), terminalError })
     })
   })
 }
@@ -478,6 +509,7 @@ function detectOpencodeBin(): string {
 }
 
 async function main() {
+  const initializeStartedAt = Date.now()
   const args = parseArgs(process.argv.slice(2))
   const instance = await readInstance(args.instanceDictPath, args.selectedId)
   // workspaceRoot is decided gym-side based on dataset_name; we use it verbatim.
@@ -539,7 +571,6 @@ async function main() {
     replayManifest,
   })
 
-  const startedAt = Date.now()
   const childEnv: NodeJS.ProcessEnv = {
     ...process.env,
     // Run-isolated opencode state.
@@ -589,6 +620,8 @@ async function main() {
   }
 
   const opencodeBin = detectOpencodeBin()
+  const initializeRuntimeTime = (Date.now() - initializeStartedAt) / 1000
+  const startedAt = Date.now()
   const result = await runOpencode({
     workspaceRoot,
     modelName,
@@ -600,6 +633,15 @@ async function main() {
 
   const patch = await capturePatch(workspaceRoot, args.patchMode, baselineCommit)
   const benchRunTime = (Date.now() - startedAt) / 1000
+  const completionMetrics = await collectCompletionMetrics(completionsDir)
+  const perTurnMetrics = {
+    response_latencies: completionMetrics.responseLatencies,
+    action_execution_latencies: result.actionExecutionLatencies,
+    token_usages: completionMetrics.tokenUsages,
+  }
+  await updateNemoGymMetrics(process.env.NEMO_GYM_METRICS_FPATH, {
+    initialize_runtime_time: initializeRuntimeTime,
+  })
 
   const error = BenchTerminalError.toGymError(result.exitCode, result.terminalError)
   const outPath = await writeOutputJsonl(args.outputDir, instance.instance_id, {
@@ -609,6 +651,7 @@ async function main() {
     metrics: {
       bench_run_time: benchRunTime,
       opencode_exit_code: result.exitCode,
+      ...perTurnMetrics,
       patch_mode: args.patchMode,
     },
     error,
