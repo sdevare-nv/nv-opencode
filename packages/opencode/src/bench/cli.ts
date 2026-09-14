@@ -437,9 +437,17 @@ function runOpencode(args: {
           const metricID = `${actionMetric.session_id}:${actionMetric.observation_id}`
           actionExecutionLatencies.set(metricID, actionMetric)
         }
-        // Keep full tool details in metrics, but expose only the event type to
-        // the outer Gym log so large inputs and outputs are not duplicated.
-        const line = actionMetric ? "tool_use" : rawLine
+        // Keep full tool details in metrics, but expose only the event type and
+        // timing to the outer Gym log so large inputs and outputs are not duplicated.
+        const line = actionMetric
+          ? JSON.stringify({
+              type: "tool_use",
+              time: {
+                start: Date.parse(actionMetric.start_timestamp),
+                end: Date.parse(actionMetric.timestamp),
+              },
+            })
+          : rawLine
         process.stdout.write(line + "\n")
         stdout = (stdout + line + "\n").slice(-MAX_KEEP)
       }
@@ -583,6 +591,7 @@ async function main() {
     // This is bench-only and does not alter normal opencode runs.
     [BenchTerminalError.ENV]: "1",
     // Avoid serializing and piping full event payloads into the gym log.
+    // Events that already have start/end time still include it.
     OPENCODE_BENCH_EVENT_TYPES_ONLY: "1",
   }
 
