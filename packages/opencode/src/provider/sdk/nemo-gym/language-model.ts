@@ -986,6 +986,15 @@ export class NemoGymLanguageModel implements LanguageModelV3 {
           headers,
           body: JSON.stringify(params),
           signal: ac.signal,
+          // Bun's fetch has its own ~300s deadline that is NOT the abort timer
+          // above. When it fires it drops the socket without aborting the
+          // signal, so vLLM is never told to cancel: the generation keeps
+          // running and holding KV while we retry the same prompt, and the
+          // orphans accumulate until the engine is wedged. Disable it and let
+          // the request run to the server-enforced max_tokens ceiling.
+          // Same option is used on the main provider path (provider.ts:1512).
+          // @ts-ignore Bun-only fetch option
+          timeout: false,
         })
         if (timer) clearTimeout(timer)
         if (!res.ok) {
